@@ -140,6 +140,59 @@ class TestInstaller(unittest.TestCase):
         self.assertEqual(dest.resolve(), (REPO_ROOT / "skills/codex/mailbox-chat").resolve())
         self.assertEqual(list(foreign_target.iterdir()), [], "Foreign directory modified by write-through!")
 
+    def test_uninstall_without_install_preserves_custom_hooks_identically(self):
+        home = self.root / "home_custom_hooks"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        custom_data = {
+            "mailbox-chat": {
+                "PreInvocation": [
+                    {"command": "/custom/mailbox-chat.py custom-mode"},
+                    {"command": "echo KEEP_ME"}
+                ]
+            },
+            "agterm-status": {
+                "custom_command": "/custom/agy-status-hook.sh special-mode"
+            },
+            "other": {"keep": True}
+        }
+        agy_json.write_text(json.dumps(custom_data))
+
+        # Uninstall without prior install must not touch hooks.json
+        self.run_installer(home, args=["--uninstall"])
+        with open(agy_json, "r", encoding="utf-8") as f:
+            content = json.load(f)
+        self.assertEqual(content, custom_data)
+
+    def test_backup_preservation_and_restore_after_install(self):
+        home = self.root / "home_backup_restore"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        custom_data = {
+            "mailbox-chat": {"custom": 1},
+            "agterm-status": {"custom": 2},
+            "other": {"keep": True}
+        }
+        agy_json.write_text(json.dumps(custom_data))
+
+        # First install creates backup and applies fragment
+        self.run_installer(home)
+        backups = list(agy_json.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(backups), 1)
+        with open(backups[0], "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), custom_data)
+
+        # Second install is idempotent, does not overwrite backup
+        self.run_installer(home)
+        backups_after = list(agy_json.parent.glob("hooks.json.bak.*"))
+        self.assertEqual(len(backups_after), 1)
+
+        # Uninstall restores original custom config
+        self.run_installer(home, args=["--uninstall"])
+        with open(agy_json, "r", encoding="utf-8") as f:
+            restored = json.load(f)
+        self.assertEqual(restored, custom_data)
+
 
 if __name__ == "__main__":
     unittest.main()

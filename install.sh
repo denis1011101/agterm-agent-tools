@@ -193,41 +193,64 @@ EOF
 manage_agy_hooks_json() {
     local target_json="$HOME/.gemini/config/hooks.json"
     local fragment_file="$SCRIPT_DIR/config/agy-hooks.json.fragment"
+    local manifest_file="$HOME/.local/state/agterm-agent-tools/manifest.json"
 
     if (( UNINSTALL )); then
-        if [[ -f "$target_json" ]]; then
-            log_action "Removing owned agterm-status and mailbox-chat from $target_json"
+        if [[ -f "$manifest_file" ]]; then
+            log_action "Reverting managed AGY lifecycle hooks from $target_json via manifest"
             if (( ! DRY_RUN )); then
                 python3 -c '
-import json, sys
+import json, sys, os
 
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except Exception:
+target_path = sys.argv[1]
+manifest_file = sys.argv[2]
+
+if not os.path.exists(manifest_file):
     sys.exit(0)
 
-changed = False
+try:
+    with open(manifest_file, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+except Exception:
+    manifest = {}
 
-# Only remove if the configuration belongs to agterm-agent-tools (not unowned custom entries)
-if "agterm-status" in data:
-    status_str = json.dumps(data["agterm-status"])
-    if "agy-status-hook.sh" in status_str:
-        del data["agterm-status"]
-        changed = True
+if os.path.exists(target_path):
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = None
 
-if "mailbox-chat" in data:
-    mb_str = json.dumps(data["mailbox-chat"])
-    if "mailbox-chat.py" in mb_str:
-        del data["mailbox-chat"]
-        changed = True
+    if isinstance(data, dict):
+        changed = False
+        orig_status = manifest.get("original_agterm_status")
+        if orig_status is not None:
+            data["agterm-status"] = orig_status
+            changed = True
+        elif "agterm-status" in data:
+            del data["agterm-status"]
+            changed = True
 
-if changed:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-' "$target_json"
+        orig_mb = manifest.get("original_mailbox_chat")
+        if orig_mb is not None:
+            data["mailbox-chat"] = orig_mb
+            changed = True
+        elif "mailbox-chat" in data:
+            del data["mailbox-chat"]
+            changed = True
+
+        if changed:
+            tmp_target = f"{target_path}.tmp.{os.getpid()}"
+            with open(tmp_target, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp_target, target_path)
+
+try:
+    os.remove(manifest_file)
+except OSError:
+    pass
+' "$target_json" "$manifest_file"
             fi
         fi
         return 0
@@ -245,10 +268,11 @@ if changed:
     log_action "Merging AGY lifecycle hooks into $target_json"
     if (( ! DRY_RUN )); then
         python3 -c '
-import json, sys, shutil, time
+import json, sys, shutil, time, uuid, os
 
 target_path = sys.argv[1]
 fragment_path = sys.argv[2]
+manifest_file = sys.argv[3]
 
 try:
     with open(fragment_path, "r", encoding="utf-8") as f:
@@ -257,32 +281,52 @@ except Exception as e:
     sys.exit(f"Failed to load fragment {fragment_path}: {e}")
 
 data = {}
-try:
+file_existed = False
+if os.path.exists(target_path):
+    file_existed = True
     with open(target_path, "r", encoding="utf-8") as f:
         content = f.read()
     if content.strip():
-        data = json.loads(content)
-except FileNotFoundError:
-    pass
-except Exception as e:
-    sys.exit(f"Error: {target_path} contains malformed or unreadable JSON ({e}). Aborting install to prevent data loss.")
+        try:
+            data = json.loads(content)
+        except Exception as e:
+            sys.exit(f"Error: {target_path} contains malformed or unreadable JSON ({e}). Aborting install to prevent data loss.")
 
-# Create backup of existing valid JSON before mutating
-if data:
-    backup_path = f"{target_path}.bak.{int(time.time())}"
+already_configured = (
+    data.get("agterm-status") == frag.get("agterm-status") and
+    data.get("mailbox-chat") == frag.get("mailbox-chat")
+)
+if already_configured:
+    # Already configured, no mutation needed
+    sys.exit(0)
+
+# Create unique exclusive backup before mutating existing configuration
+if file_existed and data:
+    backup_path = f"{target_path}.bak.{int(time.time())}_{uuid.uuid4().hex[:8]}"
     try:
         shutil.copy2(target_path, backup_path)
-    except Exception:
-        pass
+    except Exception as e:
+        sys.exit(f"Error: Failed to create backup at {backup_path}: {e}. Aborting install.")
+
+# Record manifest with original pre-install values
+os.makedirs(os.path.dirname(manifest_file), exist_ok=True)
+manifest = {
+    "file_existed": file_existed,
+    "original_agterm_status": data.get("agterm-status"),
+    "original_mailbox_chat": data.get("mailbox-chat"),
+    "installed_at": int(time.time())
+}
+with open(manifest_file, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
 
 data.update(frag)
 
-tmp_target = f"{target_path}.tmp.{int(time.time())}"
+tmp_target = f"{target_path}.tmp.{uuid.uuid4().hex}"
 with open(tmp_target, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-shutil.move(tmp_target, target_path)
-' "$target_json" "$fragment_file"
+os.replace(tmp_target, target_path)
+' "$target_json" "$fragment_file" "$manifest_file"
     fi
 }
 
