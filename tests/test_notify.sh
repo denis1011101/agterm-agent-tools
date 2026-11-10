@@ -1,19 +1,20 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# test_notify.sh — Test concurrency and fallback for production hooks/agy/agy-status-hook.sh
 set -euo pipefail
 
-export TMPDIR=$(mktemp -d /tmp/test-flock.XXXXXX)
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_SCRIPT="$(cd "$TEST_DIR/../hooks/agy" && pwd)/agy-status-hook.sh"
+
+export TMPDIR=$(mktemp -d /tmp/test-notify.XXXXXX)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-AGTERM_SESSION_ID=review-session
-AGTERM_PANE_ID=review-pane
-AGTERM_SOCKET=/tmp/review.sock
+export AGTERM_SESSION_ID="review-session"
+export AGTERM_PANE_ID="review-pane"
+export AGTERM_SOCKET="/tmp/review.sock"
 
-notify_lock_path() {
-  local pane=${AGTERM_PANE_ID:-${AGTERM_PANE:-main}}
-  local key
-  key=$(printf "%s-%s" "${AGTERM_SESSION_ID:-}" "$pane" | /usr/bin/tr -c "A-Za-z0-9._-" "_")
-  printf "%s/agterm-agy-notify-%s-%s.lock" "${TMPDIR:-/tmp}" "${UID:-$(id -u)}" "$key"
-}
+MOCK_BIN="$TMPDIR/mock_bin"
+mkdir -p "$MOCK_BIN"
+export PATH="$MOCK_BIN:$PATH"
 
 notify_file_path() {
   local pane=${AGTERM_PANE_ID:-${AGTERM_PANE:-main}}
@@ -23,60 +24,25 @@ notify_file_path() {
 }
 
 notify_desktop() {
-  local title=${1:-"Antigravity (agy)"}
-  local body=${2:-"Требуется действие"}
-  local lfile nfile
-  lfile=$(notify_lock_path)
-  nfile=$(notify_file_path)
-
-  (
-    flock -x 9 || exit 0
-
-    local now last_time=0
-    now=$(date +%s 2>/dev/null || printf "%s" "0")
-    if [ -f "$nfile" ]; then
-      last_time=$(cat "$nfile" 2>/dev/null || printf "%s" "0")
-    fi
-
-    if [ "$now" -gt 0 ] && [ "$last_time" -gt 0 ] && [ "$((now - last_time))" -lt 3 ]; then
-      exit 0
-    fi
-
-    local notify_args=()
-    [ -n "${AGTERM_SESSION_ID:-}" ] && notify_args+=(--target "$AGTERM_SESSION_ID")
-    [ -n "${AGTERM_SOCKET:-}" ] && notify_args+=(--socket "$AGTERM_SOCKET")
-
-    local delivered=0
-    local agtermctl_bin=${AGTERMCTL:-}
-    [ -n "$agtermctl_bin" ] || agtermctl_bin=$(command -v agtermctl 2>/dev/null || true)
-
-    if [ -n "$agtermctl_bin" ] && [ -x "$agtermctl_bin" ]; then
-      if "$agtermctl_bin" notify "$body" --title "$title" "${notify_args[@]+"${notify_args[@]}"}" >/dev/null 2>&1; then
-        delivered=1
-      fi
-    fi
-
-    if [ "$delivered" -eq 0 ] && command -v notify-send >/dev/null 2>&1; then
-      if notify-send -a "agterm" "$title" "$body" >/dev/null 2>&1; then
-        delivered=1
-      fi
-    fi
-
-    if [ "$delivered" -eq 1 ] && [ "$now" -gt 0 ]; then
-      printf "%s\n" "$now" > "$nfile" 2>/dev/null || true
-    fi
-  ) 9>"$lfile" >/dev/null 2>&1 || true
+  "$HOOK_SCRIPT" __notify "${1:-test}" "${2:-test}"
 }
 
-review_log=$TMPDIR/calls
+review_log="$TMPDIR/calls"
 : > "$review_log"
-notify-send() { printf "fallback\n" >> "$review_log"; }
+
+# Mock notify-send
+cat > "$MOCK_BIN/notify-send" <<'EOF'
+#!/bin/bash
+printf "fallback\n" >> "$TMPDIR/calls"
+exit 0
+EOF
+chmod +x "$MOCK_BIN/notify-send"
 
 echo "=== TEST 1: Missing AGTERMCTL falls back to notify-send ==="
-AGTERMCTL=/nonexistent/review-agtermctl
-notify_desktop test test
+export AGTERMCTL="/nonexistent/review-agtermctl"
+notify_desktop "Test Title" "Test Body"
 if grep -q "fallback" "$review_log"; then
-  echo "PASS: fallback called"
+  echo "PASS: fallback called in production hook"
 else
   echo "FAIL: fallback not called"
   exit 1
@@ -85,8 +51,14 @@ fi
 echo "=== TEST 2: Failed sender does not record timestamp ==="
 rm -f "$(notify_file_path)"
 : > "$review_log"
-notify-send() { return 1; }
-notify_desktop test test
+
+# Make notify-send fail
+cat > "$MOCK_BIN/notify-send" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+
+notify_desktop "Test Title" "Test Body"
 if [ -f "$(notify_file_path)" ]; then
   echo "FAIL: timestamp recorded on failure"
   exit 1
@@ -96,18 +68,20 @@ fi
 
 echo "=== TEST 3: Concurrent calls in same pane serialize and send only 1 ==="
 : > "$review_log"
-cat > "$TMPDIR/agtermctl" <<'MOCK'
+
+# Mock agtermctl to simulate delayed delivery
+cat > "$MOCK_BIN/agtermctl" <<'EOF'
 #!/bin/bash
 sleep 0.2
 printf "notify\n" >> "$TMPDIR/calls"
 exit 0
-MOCK
-chmod +x "$TMPDIR/agtermctl"
-export AGTERMCTL=$TMPDIR/agtermctl
+EOF
+chmod +x "$MOCK_BIN/agtermctl"
+export AGTERMCTL="$MOCK_BIN/agtermctl"
 
-notify_desktop test test &
+notify_desktop "Test" "Concurrent 1" &
 pid1=$!
-notify_desktop test test &
+notify_desktop "Test" "Concurrent 2" &
 pid2=$!
 wait "$pid1" "$pid2"
 
@@ -118,4 +92,4 @@ else
   exit 1
 fi
 
-echo "ALL NOTIFY TESTS PASSED!"
+echo "ALL PRODUCTION NOTIFY TESTS PASSED!"

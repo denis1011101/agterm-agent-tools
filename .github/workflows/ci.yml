@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test-python:
+    name: Python Unit Tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # For Python < 3.11, install tomli for TOML parsing in installer tests
+          pip install tomli || true
+
+      - name: Compile Python files (syntax validation)
+        run: |
+          python -m py_compile bin/mailbox-chat.py
+          python -m py_compile tests/test_*.py
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+  test-shell:
+    name: Shell Tests & Linter
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck --severity=error \
+            bin/codex-mailbox \
+            install.sh \
+            examples/upd_all.sh \
+            hooks/agy/*.sh \
+            hooks/agterm/*.sh \
+            tests/*.sh
+
+      - name: Run Desktop Notification Tests
+        run: |
+          bash tests/test_notify.sh
+
+      - name: Run Network Recovery Tests
+        run: |
+          bash tests/test_network_recovery.sh
+
+  test-installer:
+    name: Installer Lifecycle Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test installer dry-run
+        run: |
+          ./install.sh --dry-run
+
+      - name: Test clean installation
+        run: |
+          mkdir -p "$HOME/.codex"
+          ./install.sh
+
+      - name: Verify installed symlinks & files
+        run: |
+          test -L "$HOME/.local/bin/mailbox-chat.py"
+          test -L "$HOME/.local/bin/codex-mailbox"
+          test -L "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+          test -L "$HOME/.config/agterm/agent-status/agterm-agent-status.sh"
+          test -L "$HOME/.config/agterm/agent-status/agterm-codex-status.sh"
+          test -L "$HOME/.gemini/config/skills/mailbox-chat"
+          test -L "$HOME/.codex/skills/mailbox-chat"
+          grep -q "mailbox-chat.py" "$HOME/.config/agterm/hooks.conf"
+          grep -q "agterm-status" "$HOME/.gemini/config/hooks.json"
+          grep -q "mailbox-chat.py" "$HOME/.codex/config.toml"
+
+      - name: Test uninstallation
+        run: |
+          ./install.sh --uninstall
+          test ! -L "$HOME/.local/bin/mailbox-chat.py"
+          test ! -L "$HOME/.local/bin/codex-mailbox"
+          test ! -L "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+          test ! -L "$HOME/.gemini/config/skills/mailbox-chat"
+          test ! -L "$HOME/.codex/skills/mailbox-chat"

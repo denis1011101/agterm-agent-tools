@@ -60,7 +60,7 @@ Integrates **Google Antigravity (`agy`)** and **OpenAI Codex CLI (`codex`)** run
 │   ├── agy/mailbox-chat/             # Agent skill for Antigravity
 │   └── codex/mailbox-chat/           # Agent skill for Codex
 ├── tests/
-│   ├── network_helpers.sh            # Network detection helper functions
+│   ├── test_installer.py             # Unit tests for installer and lifecycle management
 │   ├── test_linux_agy.py             # Unit tests for agy-wait and Linux mailbox transport
 │   ├── test_mailbox_chat.py          # Unit tests for mailbox-chat protocol
 │   ├── test_network_recovery.sh      # Test suite for NetworkManager recovery logic
@@ -150,15 +150,17 @@ mailbox-chat.py agy-wait
 All components include automated test coverage:
 
 ```bash
-# 1. Run Python unit tests (53 tests)
+# 1. Run Python unit tests (58 tests: protocol, linux transport, installer)
 python3 -m unittest discover -s tests -p "test_*.py"
 
-# 2. Run Desktop notification test suite
+# 2. Run Desktop notification test suite (against production agy-status-hook.sh)
 bash tests/test_notify.sh
 
-# 3. Run Network recovery test suite
+# 3. Run Network recovery test suite (against production examples/upd_all.sh)
 bash tests/test_network_recovery.sh
 ```
+
+Continuous integration runs automatically on GitHub Actions (`.github/workflows/ci.yml`) on every push and pull request across Python 3.8–3.12, running ShellCheck and the complete test suites.
 
 ---
 

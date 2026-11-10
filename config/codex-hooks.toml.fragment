@@ -1,8 +1,13 @@
-# >>> agterm agent-status >>>
+# >>> agterm-agent-tools >>>
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
 command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' session-start"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "\"/home/USER/.local/bin/mailbox-chat.py\" codex-hook"
 
 [[hooks.UserPromptSubmit]]
 [[hooks.UserPromptSubmit.hooks]]
@@ -28,4 +33,4 @@ command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' permi
 [[hooks.Stop.hooks]]
 type = "command"
 command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' stop"
-# <<< agterm agent-status <<<
+# <<< agterm-agent-tools <<<

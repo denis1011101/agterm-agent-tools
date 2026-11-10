@@ -36,7 +36,7 @@ Components installed:
       ~/.codex/skills/mailbox-chat         -> skills/codex/mailbox-chat
   - Configuration:
       ~/.gemini/config/hooks.json (merged agy lifecycle hooks)
-      ~/.codex/config.toml (Codex lifecycle hooks, if ~/.codex exists)
+      ~/.codex/config.toml (Codex lifecycle & mailbox hooks, if ~/.codex exists)
 EOF
 }
 
@@ -119,13 +119,15 @@ make_symlink() {
         else
             log_action "Updating symlink: $dest -> $src"
             if (( ! DRY_RUN )); then
-                ln -sf "$src" "$dest"
+                # Remove old symlink first so ln doesn't write into target if it was a directory
+                rm -f "$dest"
+                ln -s "$src" "$dest"
             fi
             return 0
         fi
     elif [[ -e "$dest" ]]; then
         local backup="${dest}.bak.$(date +%Y%m%d%H%M%S)"
-        log_action "Backing up existing file: $dest -> $backup"
+        log_action "Backing up existing non-symlink: $dest -> $backup"
         if (( ! DRY_RUN )); then
             mv "$dest" "$backup"
             ln -s "$src" "$dest"
@@ -144,15 +146,14 @@ manage_agterm_hooks_conf() {
 
     if (( UNINSTALL )); then
         if [[ -f "$conf_file" ]]; then
-            if grep -q "mailbox-chat.py" "$conf_file"; then
-                log_action "Removing mailbox-chat hook from $conf_file"
+            if grep -q "agterm-agent-tools" "$conf_file"; then
+                log_action "Removing agterm-agent-tools block from $conf_file"
                 if (( ! DRY_RUN )); then
                     local tmp_conf
                     tmp_conf="$(mktemp)"
                     awk '
                         /# >>> agterm-agent-tools >>>/ { skip=1; next }
                         /# <<< agterm-agent-tools <<</ { skip=0; next }
-                        /mailbox-chat\.py agterm-hook/ { next }
                         !skip { print }
                     ' "$conf_file" > "$tmp_conf"
                     mv "$tmp_conf" "$conf_file"
@@ -171,9 +172,11 @@ manage_agterm_hooks_conf() {
         fi
     fi
 
-    if [[ -f "$conf_file" ]] && grep -q "mailbox-chat.py agterm-hook" "$conf_file"; then
-        log_action "agterm hooks.conf already contains mailbox-chat hook"
-        return 0
+    if [[ -f "$conf_file" ]]; then
+        if grep -q "# >>> agterm-agent-tools >>>" "$conf_file" || grep -q 'mailbox-chat\.py"*[[:space:]]*agterm-hook' "$conf_file"; then
+            log_action "agterm hooks.conf already contains mailbox-chat hook"
+            return 0
+        fi
     fi
 
     log_action "Adding mailbox-chat hook to $conf_file"
@@ -193,21 +196,33 @@ manage_agy_hooks_json() {
 
     if (( UNINSTALL )); then
         if [[ -f "$target_json" ]]; then
-            log_action "Removing agterm-status and mailbox-chat from $target_json"
+            log_action "Removing owned agterm-status and mailbox-chat from $target_json"
             if (( ! DRY_RUN )); then
                 python3 -c '
 import json, sys
+
 path = sys.argv[1]
 try:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 except Exception:
     sys.exit(0)
+
 changed = False
-for key in ["agterm-status", "mailbox-chat"]:
-    if key in data:
-        del data[key]
+
+# Only remove if the configuration belongs to agterm-agent-tools (not unowned custom entries)
+if "agterm-status" in data:
+    status_str = json.dumps(data["agterm-status"])
+    if "agy-status-hook.sh" in status_str:
+        del data["agterm-status"]
         changed = True
+
+if "mailbox-chat" in data:
+    mb_str = json.dumps(data["mailbox-chat"])
+    if "mailbox-chat.py" in mb_str:
+        del data["mailbox-chat"]
+        changed = True
+
 if changed:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -230,7 +245,8 @@ if changed:
     log_action "Merging AGY lifecycle hooks into $target_json"
     if (( ! DRY_RUN )); then
         python3 -c '
-import json, sys
+import json, sys, shutil, time
+
 target_path = sys.argv[1]
 fragment_path = sys.argv[2]
 
@@ -238,22 +254,34 @@ try:
     with open(fragment_path, "r", encoding="utf-8") as f:
         frag = json.load(f)
 except Exception as e:
-    sys.exit(f"Failed to load fragment: {e}")
+    sys.exit(f"Failed to load fragment {fragment_path}: {e}")
 
 data = {}
 try:
     with open(target_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        content = f.read()
+    if content.strip():
+        data = json.loads(content)
 except FileNotFoundError:
     pass
 except Exception as e:
-    print(f"Warning: could not parse existing {target_path}: {e}")
+    sys.exit(f"Error: {target_path} contains malformed or unreadable JSON ({e}). Aborting install to prevent data loss.")
+
+# Create backup of existing valid JSON before mutating
+if data:
+    backup_path = f"{target_path}.bak.{int(time.time())}"
+    try:
+        shutil.copy2(target_path, backup_path)
+    except Exception:
+        pass
 
 data.update(frag)
 
-with open(target_path, "w", encoding="utf-8") as f:
+tmp_target = f"{target_path}.tmp.{int(time.time())}"
+with open(tmp_target, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
+shutil.move(tmp_target, target_path)
 ' "$target_json" "$fragment_file"
     fi
 }
@@ -261,21 +289,20 @@ with open(target_path, "w", encoding="utf-8") as f:
 manage_codex_hooks() {
     local codex_dir="$HOME/.codex"
     local codex_conf="$codex_dir/config.toml"
-    local fragment_file="$SCRIPT_DIR/config/codex-hooks.toml.fragment"
 
     if [[ ! -d "$codex_dir" ]]; then
         return 0
     fi
 
     if (( UNINSTALL )); then
-        if [[ -f "$codex_conf" ]] && grep -q "agterm-codex-status.sh" "$codex_conf"; then
-            log_action "Removing Codex lifecycle hooks from $codex_conf"
+        if [[ -f "$codex_conf" ]] && grep -q "# >>> agterm-agent-tools >>>" "$codex_conf"; then
+            log_action "Removing agterm-agent-tools block from $codex_conf"
             if (( ! DRY_RUN )); then
                 local tmp_toml
                 tmp_toml="$(mktemp)"
                 awk '
-                    /# >>> agterm agent-status >>>/ { skip=1; next }
-                    /# <<< agterm agent-status <<</ { skip=0; next }
+                    /# >>> agterm-agent-tools >>>/ { skip=1; next }
+                    /# <<< agterm-agent-tools <<</ { skip=0; next }
                     !skip { print }
                 ' "$codex_conf" > "$tmp_toml"
                 mv "$tmp_toml" "$codex_conf"
@@ -284,21 +311,28 @@ manage_codex_hooks() {
         return 0
     fi
 
-    if [[ -f "$codex_conf" ]] && grep -q "agterm-codex-status.sh" "$codex_conf"; then
-        log_action "Codex config.toml already contains agterm status hooks"
-        return 0
+    if [[ -f "$codex_conf" ]]; then
+        if grep -q "# >>> agterm-agent-tools >>>" "$codex_conf"; then
+            log_action "Codex config.toml already contains agterm-agent-tools block"
+            return 0
+        fi
     fi
 
-    log_action "Configuring Codex lifecycle hooks in $codex_conf"
+    log_action "Configuring Codex lifecycle & mailbox hooks in $codex_conf"
     if (( ! DRY_RUN )); then
         local user_home="$HOME"
         cat >> "$codex_conf" <<EOF
 
-# >>> agterm agent-status >>>
+# >>> agterm-agent-tools >>>
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
 command = "'$user_home/.config/agterm/agent-status/agterm-codex-status.sh' session-start"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "\"$user_home/.local/bin/mailbox-chat.py\" codex-hook"
 
 [[hooks.UserPromptSubmit]]
 [[hooks.UserPromptSubmit.hooks]]
@@ -324,7 +358,7 @@ command = "'$user_home/.config/agterm/agent-status/agterm-codex-status.sh' permi
 [[hooks.Stop.hooks]]
 type = "command"
 command = "'$user_home/.config/agterm/agent-status/agterm-codex-status.sh' stop"
-# <<< agterm agent-status <<<
+# <<< agterm-agent-tools <<<
 EOF
     fi
 }

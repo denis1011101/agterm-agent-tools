@@ -1,18 +1,17 @@
 #!/bin/bash
+# upd_all.sh — Resilient Linux & AI agent toolkit updater with network recovery
 
 # Таймаут действует на dpkg-блокировку (upgrade/dist-upgrade), но не на
 # /var/lib/apt/lists/lock у apt-get update (Debian #1069167) — её ждём сами.
 APT_OPTS=(-o DPkg::Lock::Timeout=300)
-
-# Сначала запрашиваем пароль, пока пользователь ещё у терминала.
-echo "==> Запрос sudo..."
-sudo -v || exit 1
 
 SUDO_REFRESH_PID=
 NETWORK_RESTARTING=0
 RESTORE_UUID=
 RESTORE_DEV=
 RESTORE_NAME=
+RESTORE_TYPE=
+
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
@@ -27,27 +26,6 @@ cleanup() {
     fi
     exit "$status"
 }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# -n запрещает фоновый запрос пароля; -v обновляет timestamp явно.
-(
-    refresh_sleep_pid=
-    trap 'if [[ -n $refresh_sleep_pid ]]; then
-              kill "$refresh_sleep_pid" 2>/dev/null || true
-              wait "$refresh_sleep_pid" 2>/dev/null || true
-          fi
-          exit 0' INT TERM
-    while kill -0 "$$" 2>/dev/null; do
-        sudo -n -v || exit 1
-        sleep 50 &
-        refresh_sleep_pid=$!
-        wait "$refresh_sleep_pid"
-        refresh_sleep_pid=
-    done
-) 2>/dev/null &
-SUDO_REFRESH_PID=$!
 
 # --- Проверка интернет-подключения и автоперезапуск сетевого соединения ---
 
@@ -298,13 +276,6 @@ ensure_network() {
     return 1
 }
 
-if ! ensure_network; then
-    exit 1
-fi
-
-# apt-get update с повтором, если lists/lock занят (packagekitd и т.п.), до 5 минут.
-# LC_ALL=C — чтобы текст ошибки не зависел от локали.
-# Error-Mode=any — иначе при недоступном репозитории update возвращает 0.
 apt_update() {
     local deadline=$((SECONDS + 300)) log
     log=$(mktemp)
@@ -317,52 +288,9 @@ apt_update() {
     done
 }
 
-failed=0
-if apt_update; then
-    sudo apt-get "${APT_OPTS[@]}" upgrade -y \
-        && sudo apt-get "${APT_OPTS[@]}" dist-upgrade -y \
-        && sudo apt-get "${APT_OPTS[@]}" autoremove -y \
-        || failed=1
-else
-    failed=1
-fi
-(( failed )) && echo "==> Обновление системных пакетов не удалось, продолжаю с CLI-инструментами"
-
-
-# --- Обновление CLI-инструментов ---
-
-# OpenCode (curl-установка в ~/.opencode)
-if command -v opencode >/dev/null 2>&1; then
-    echo "==> Обновление OpenCode (текущая: $(opencode --version 2>/dev/null))"
-    opencode upgrade --method curl || { echo "==> Обновление OpenCode не удалось"; failed=1; }
-    echo "==> OpenCode: $(opencode --version 2>/dev/null)"
-else
-    echo "==> opencode не найден в PATH, пропускаю"
-fi
-
-# Antigravity CLI (agy, установлен в ~/.local/bin)
-if command -v agy >/dev/null 2>&1; then
-    echo "==> Обновление agy (текущая: $(agy --version 2>/dev/null))"
-    agy update || { echo "==> Обновление agy не удалось"; failed=1; }
-    echo "==> agy: $(agy --version 2>/dev/null)"
-else
-    echo "==> agy не найден в PATH, пропускаю"
-fi
-
-# Codex CLI (standalone-установка в ~/.codex)
-if command -v codex >/dev/null 2>&1; then
-    echo "==> Обновление Codex (текущая: $(codex --version 2>/dev/null))"
-    codex update || { echo "==> Обновление Codex не удалось"; failed=1; }
-    echo "==> Codex: $(codex --version 2>/dev/null)"
-else
-    echo "==> codex не найден в PATH, пропускаю"
-fi
-
-# agterm-linux (ставится из .deb с GitHub-релизов, apt-репозитория нет)
 update_agterm() {
     local repo=melonamin/agterm-linux installed latest tag deb sums dir
     installed=$(dpkg-query -W -f '${Version}' agterm-linux 2>/dev/null) || { echo "==> agterm-linux не установлен, пропускаю"; return 0; }
-    # Тег вида linux-v0.26.1; в dpkg версия 0.26.1-1 — сравниваем без debian-ревизии
     tag=$(curl -fsS --max-time 30 -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/$repo/releases/latest" | jq -r '.tag_name // empty') \
         || { echo "==> agterm: не удалось запросить GitHub API (лимит или сеть), пропускаю"; return 1; }
@@ -376,7 +304,7 @@ update_agterm() {
     deb="agterm-linux-v$latest-x86_64.deb"
     sums="agterm-linux-v$latest-SHA256SUMS"
     dir=$(mktemp -d)
-    chmod 755 "$dir"  # иначе _apt не может прочитать .deb и apt ругается N: ... unsandboxed as root
+    chmod 755 "$dir"
     (
         cd "$dir" \
         && curl -fSL --max-time 600 -o "$deb" "https://github.com/$repo/releases/download/$tag/$deb" \
@@ -387,6 +315,82 @@ update_agterm() {
     rm -rf "$dir"
     echo "==> agterm-linux: $(dpkg-query -W -f '${Version}' agterm-linux)"
 }
+
+# If sourced as a library (e.g. by unit/integration tests), return early without running main
+if (return 0 2>/dev/null); then
+    return 0
+fi
+
+# Main execution:
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Сначала запрашиваем пароль, пока пользователь ещё у терминала.
+echo "==> Запрос sudo..."
+sudo -v || exit 1
+
+# -n запрещает фоновый запрос пароля; -v обновляет timestamp явно.
+(
+    refresh_sleep_pid=
+    trap 'if [[ -n $refresh_sleep_pid ]]; then
+              kill "$refresh_sleep_pid" 2>/dev/null || true
+              wait "$refresh_sleep_pid" 2>/dev/null || true
+          fi
+          exit 0' INT TERM
+    while kill -0 "$$" 2>/dev/null; do
+        sudo -n -v || exit 1
+        sleep 50 &
+        refresh_sleep_pid=$!
+        wait "$refresh_sleep_pid"
+        refresh_sleep_pid=
+    done
+) 2>/dev/null &
+SUDO_REFRESH_PID=$!
+
+if ! ensure_network; then
+    exit 1
+fi
+
+failed=0
+if apt_update; then
+    sudo apt-get "${APT_OPTS[@]}" upgrade -y \
+        && sudo apt-get "${APT_OPTS[@]}" dist-upgrade -y \
+        && sudo apt-get "${APT_OPTS[@]}" autoremove -y \
+        || failed=1
+else
+    failed=1
+fi
+(( failed )) && echo "==> Обновление системных пакетов не удалось, продолжаю с CLI-инструментами"
+
+# OpenCode
+if command -v opencode >/dev/null 2>&1; then
+    echo "==> Обновление OpenCode (текущая: $(opencode --version 2>/dev/null))"
+    opencode upgrade --method curl || { echo "==> Обновление OpenCode не удалось"; failed=1; }
+    echo "==> OpenCode: $(opencode --version 2>/dev/null)"
+else
+    echo "==> opencode не найден в PATH, пропускаю"
+fi
+
+# Antigravity CLI (agy)
+if command -v agy >/dev/null 2>&1; then
+    echo "==> Обновление agy (текущая: $(agy --version 2>/dev/null))"
+    agy update || { echo "==> Обновление agy не удалось"; failed=1; }
+    echo "==> agy: $(agy --version 2>/dev/null)"
+else
+    echo "==> agy не найден в PATH, пропускаю"
+fi
+
+# Codex CLI
+if command -v codex >/dev/null 2>&1; then
+    echo "==> Обновление Codex (текущая: $(codex --version 2>/dev/null))"
+    codex update || { echo "==> Обновление Codex не удалось"; failed=1; }
+    echo "==> Codex: $(codex --version 2>/dev/null)"
+else
+    echo "==> codex не найден в PATH, пропускаю"
+fi
+
+# agterm-linux
 update_agterm || failed=1
 
 exit $failed

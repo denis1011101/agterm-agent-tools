@@ -186,6 +186,11 @@ if [ "$action" = "__watch-blocked" ]; then
   exit 0
 fi
 
+if [ "$action" = "__notify" ]; then
+  notify_desktop "${2:-}" "${3:-}"
+  exit 0
+fi
+
 payload=""
 
 case "$action" in
