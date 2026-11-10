@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+
+# Secrets & credentials
+*.env
+*.key
+*.pem
+auth.json
+settings.json
+credentials.json
+
+# SQLite databases & runtime locks
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*.lock
+*.ts
+*.pid
+
+# Temporary & backup files
+*.bak
+*.bak*
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# Agent logs and session brain
+brain/
+.system_generated/
+logs/
+*.log

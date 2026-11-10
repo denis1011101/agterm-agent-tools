@@ -1,0 +1,31 @@
+# >>> agterm agent-status >>>
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' session-start"
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' user-prompt-submit"
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' pre-tool-use"
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' post-tool-use"
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' permission-request"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "'/home/USER/.config/agterm/agent-status/agterm-codex-status.sh' stop"
+# <<< agterm agent-status <<<

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Start Codex in no-daemon mode with neutral READY prompt for agterm mailbox-chat
+CODEX_BIN="${CODEX_BIN:-$(command -v codex || echo "$HOME/.local/bin/codex")}"
+exec "$CODEX_BIN" --no-daemon "$@" "Answer with the single word READY."

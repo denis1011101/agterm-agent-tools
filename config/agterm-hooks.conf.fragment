@@ -1,0 +1,2 @@
+# Mailbox chat (local Linux adaptation)
+on message /home/USER/.local/bin/mailbox-chat.py agterm-hook
