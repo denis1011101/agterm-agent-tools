@@ -105,6 +105,12 @@ To cleanly remove all symlinks and configurations:
 ./install.sh --uninstall
 ```
 
+> [!NOTE]
+> **Data Loss Prevention & Safe Ambiguity Preservation**:
+> `install.sh --uninstall` uses transactional manifest tracking and similarity analysis to surgically remove only hooks installed by this toolkit, preserving all user customizations and foreign hooks.
+>
+> If a configuration is detected with ambiguous hook ownership (e.g., identical similarity scores across user-edited matchers) or if more than 6 candidate matchers remain after untouched-entry reduction, the uninstaller stops conservatively with exit code 0 and logs a preservation message. In this scenario, all configuration files, manifest, and symlinks are retained intact to prevent any destructive deletion of user settings.
+
 ---
 
 ## Usage
