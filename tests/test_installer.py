@@ -865,6 +865,38 @@ class TestInstaller(unittest.TestCase):
             result = json.loads(agy_json.read_text())
             self.assertEqual(result, expected, f"Failed case {case_name}")
 
+    def test_unresolved_tied_ownership_preserves_configuration_and_manifest(self):
+        home = self.root / "home_tied_ownership_preserve"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    copy.deepcopy(matcher),
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        self.assertTrue(manifest_file.exists())
+
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["PreToolUse"][0]["hooks"][0]["command"] = "echo UPDATED"
+        data["agterm-status"]["PreToolUse"].reverse()
+        custom = {"type": "command", "command": "echo KEEP_ME"}
+        data["agterm-status"]["PreToolUse"][0]["hooks"].insert(0, custom)
+        agy_json.write_text(json.dumps(data))
+        before_bytes = agy_json.read_bytes()
+
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(agy_json.read_bytes(), before_bytes)
+        self.assertTrue(manifest_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

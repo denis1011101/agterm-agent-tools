@@ -238,8 +238,9 @@ manage_agy_hooks_json() {
         if [[ -f "$manifest_file" ]]; then
             log_action "Removing managed AGY lifecycle hooks via manifest from $target_json"
             if (( ! DRY_RUN )); then
+                local py_status=0
                 python3 -c '
-import json, sys, os, copy
+import json, sys, os, copy, itertools
 
 target_path = sys.argv[1]
 fragment_path = sys.argv[2]
@@ -634,90 +635,116 @@ def rollback_mutations(data, manifest):
 
             target_hooks = m.get("target_hooks")
 
-            # 1. Pair each curr_matcher with the best matching orig_matcher
-            pair_scores = []
-            for c_i, (c_idx, cm) in enumerate(curr_matchers):
-                for o_i, om in enumerate(orig_matchers):
-                    s = score_matcher_similarity(cm, om)
-                    pair_scores.append((s, c_i, o_i))
+            n_curr = len(curr_matchers)
+            n_orig = len(orig_matchers)
 
-            pair_scores.sort(key=lambda x: x[0], reverse=True)
-            paired_curr_to_orig = {}
-            used_curr = set()
-            used_orig = set()
-            for s, c_i, o_i in pair_scores:
-                if c_i not in used_curr and o_i not in used_orig:
-                    paired_curr_to_orig[c_i] = o_i
-                    used_curr.add(c_i)
-                    used_orig.add(o_i)
+            candidate_mappings = []
+            if n_curr <= n_orig:
+                for o_subset in itertools.permutations(range(n_orig), n_curr):
+                    candidate_mappings.append(list(zip(range(n_curr), o_subset)))
+            else:
+                for c_subset in itertools.permutations(range(n_curr), n_orig):
+                    candidate_mappings.append(list(zip(c_subset, range(n_orig))))
 
-            # 2. In each paired orig_matcher, identify preserved original children matching this hook
-            protected_sub_hooks = set()  # set of (c_idx, s_idx)
-            for c_i, (c_idx, cm) in enumerate(curr_matchers):
-                if c_i in paired_curr_to_orig:
-                    o_i = paired_curr_to_orig[c_i]
-                    om = orig_matchers[o_i]
-                    orig_hooks = []
-                    for oh in om.get("hooks", []):
-                        if isinstance(oh, dict) and "command" in oh:
-                            oh_info = get_managed_hook_info(oh["command"])
-                            if oh_info and oh_info["binary"] == sub_info["binary"] and oh_info["canonical"] == sub_info["canonical"]:
-                                orig_hooks.append(oh)
+            if not candidate_mappings:
+                candidate_mappings = [[]]
 
-                    unconsumed_oh = list(orig_hooks)
-                    # Pass 1: exact matches
+            best_score = -1
+            best_mappings = []
+
+            for mapping in candidate_mappings:
+                tot = 0
+                for c_i, o_i in mapping:
+                    s = score_matcher_similarity(curr_matchers[c_i][1], orig_matchers[o_i])
+                    if target_hooks is not None:
+                        c_h = curr_matchers[c_i][1].get("hooks", [])
+                        if any(th in c_h for th in target_hooks):
+                            s += 1000
+                    tot += s
+                if tot > best_score:
+                    best_score = tot
+                    best_mappings = [mapping]
+                elif tot == best_score:
+                    best_mappings.append(mapping)
+
+            def get_target_for_mapping(mapping):
+                paired_curr_to_orig = {c_i: o_i for c_i, o_i in mapping}
+                protected_sub_hooks = set()
+                for c_i, (c_idx, cm) in enumerate(curr_matchers):
+                    if c_i in paired_curr_to_orig:
+                        o_i = paired_curr_to_orig[c_i]
+                        om = orig_matchers[o_i]
+                        orig_hooks = []
+                        for oh in om.get("hooks", []):
+                            if isinstance(oh, dict) and "command" in oh:
+                                oh_info = get_managed_hook_info(oh["command"])
+                                if oh_info and oh_info["binary"] == sub_info["binary"] and oh_info["canonical"] == sub_info["canonical"]:
+                                    orig_hooks.append(oh)
+                        unconsumed_oh = list(orig_hooks)
+                        for s_idx, sh in enumerate(cm.get("hooks", [])):
+                            if isinstance(sh, dict) and "command" in sh:
+                                sh_info = get_managed_hook_info(sh["command"])
+                                if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
+                                    if sh in unconsumed_oh:
+                                        protected_sub_hooks.add((c_idx, s_idx))
+                                        unconsumed_oh.remove(sh)
+                        for s_idx, sh in enumerate(cm.get("hooks", [])):
+                            if (c_idx, s_idx) not in protected_sub_hooks and isinstance(sh, dict) and "command" in sh:
+                                sh_info = get_managed_hook_info(sh["command"])
+                                if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
+                                    if unconsumed_oh:
+                                        protected_sub_hooks.add((c_idx, s_idx))
+                                        unconsumed_oh.pop(0)
+
+                best_t_m = None
+                best_t_c_idx = -1
+                best_t_s = -1
+                best_c_score = -1
+
+                for c_i, (c_idx, cm) in enumerate(curr_matchers):
+                    m_affinity = 0
+                    if target_hooks is not None:
+                        cm_hooks = cm.get("hooks", [])
+                        matches = sum(1 for th in target_hooks if th in cm_hooks)
+                        m_affinity += matches * 100
+                    if c_i in paired_curr_to_orig:
+                        om = orig_matchers[paired_curr_to_orig[c_i]]
+                        om_has_canonical = any(
+                            isinstance(oh, dict) and (get_managed_hook_info(oh.get("command", "")) or {}).get("canonical") == sub_info["canonical"]
+                            for oh in om.get("hooks", [])
+                        )
+                        if not om_has_canonical:
+                            m_affinity += 500
+
                     for s_idx, sh in enumerate(cm.get("hooks", [])):
+                        if (c_idx, s_idx) in protected_sub_hooks:
+                            continue
                         if isinstance(sh, dict) and "command" in sh:
                             sh_info = get_managed_hook_info(sh["command"])
                             if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
-                                if sh in unconsumed_oh:
-                                    protected_sub_hooks.add((c_idx, s_idx))
-                                    unconsumed_oh.remove(sh)
-                    # Pass 2: remaining canonical matches (e.g. user edited timeout)
-                    for s_idx, sh in enumerate(cm.get("hooks", [])):
-                        if (c_idx, s_idx) not in protected_sub_hooks and isinstance(sh, dict) and "command" in sh:
-                            sh_info = get_managed_hook_info(sh["command"])
-                            if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
-                                if unconsumed_oh:
-                                    protected_sub_hooks.add((c_idx, s_idx))
-                                    unconsumed_oh.pop(0)
+                                if sh.get("timeout") == m["hook"].get("timeout"):
+                                    if m_affinity > best_c_score:
+                                        best_c_score = m_affinity
+                                        best_t_m = cm
+                                        best_t_c_idx = c_idx
+                                        best_t_s = s_idx
+                return (best_t_m, best_t_c_idx, best_t_s, best_c_score)
 
-            # 3. Find the best candidate hook to delete:
-            # Must match sub_info["canonical"] and m["hook"]["timeout"], and not be in protected_sub_hooks.
-            best_target_m = None
-            best_target_s_idx = -1
-            best_candidate_score = -1
+            targets = set()
+            target_results = []
+            for mapping in best_mappings:
+                res = get_target_for_mapping(mapping)
+                if res[0] is not None and res[2] != -1 and res[3] > 0:
+                    targets.add((res[1], res[2]))
+                    target_results.append(res)
 
-            for c_i, (c_idx, cm) in enumerate(curr_matchers):
-                m_affinity = 0
-                if target_hooks is not None:
-                    cm_hooks = cm.get("hooks", [])
-                    matches = sum(1 for th in target_hooks if th in cm_hooks)
-                    m_affinity += matches * 100
-
-                if c_i in paired_curr_to_orig:
-                    om = orig_matchers[paired_curr_to_orig[c_i]]
-                    om_has_canonical = any(
-                        isinstance(oh, dict) and (get_managed_hook_info(oh.get("command", "")) or {}).get("canonical") == sub_info["canonical"]
-                        for oh in om.get("hooks", [])
-                    )
-                    if not om_has_canonical:
-                        m_affinity += 500
-
-                for s_idx, sh in enumerate(cm.get("hooks", [])):
-                    if (c_idx, s_idx) in protected_sub_hooks:
-                        continue
-                    if isinstance(sh, dict) and "command" in sh:
-                        sh_info = get_managed_hook_info(sh["command"])
-                        if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
-                            if sh.get("timeout") == m["hook"].get("timeout"):
-                                if m_affinity > best_candidate_score:
-                                    best_candidate_score = m_affinity
-                                    best_target_m = cm
-                                    best_target_s_idx = s_idx
-
-            if best_target_m is not None and best_target_s_idx != -1 and best_candidate_score > 0:
-                del best_target_m["hooks"][best_target_s_idx]
+            if len(targets) > 1:
+                # Ambiguous tied ownership detected across plausible assignments!
+                # Abort before destructive changes to preserve user configuration.
+                sys.exit(10)
+            elif len(targets) == 1:
+                t_m, t_c_idx, t_s, t_score = target_results[0]
+                del t_m["hooks"][t_s]
                 changed = True
         elif m_type == "upgrade_sub":
             pattern = m["pattern"]
@@ -818,7 +845,14 @@ try:
     os.remove(manifest_file)
 except OSError:
     pass
-' "$target_json" "$fragment_file" "$manifest_file"
+' "$target_json" "$fragment_file" "$manifest_file" || py_status=$?
+                if (( py_status == 10 )); then
+                    log_action "Ambiguous mutation ownership detected; safely preserving configuration, manifest, and symlinks."
+                    exit 0
+                elif (( py_status != 0 )); then
+                    log_error "Error rolling back hooks (exit code $py_status)"
+                    return 1
+                fi
             fi
         fi
         return 0
