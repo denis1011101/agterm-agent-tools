@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for install.sh installer and lifecycle management."""
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -662,6 +663,60 @@ class TestInstaller(unittest.TestCase):
             for sh in m.get("hooks", [])
         )
         self.assertTrue(has_ask40)
+
+    def test_same_default_timeout_reordered_matcher_protected_on_uninstall(self):
+        home = self.root / "home_same_timeout_reorder"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    copy.deepcopy(matcher),
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["PreToolUse"].reverse()
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        expected = copy.deepcopy(original)
+        expected["agterm-status"]["PreToolUse"].reverse()
+        self.assertEqual(result, expected)
+
+    def test_legacy_manifest_repair_merges_and_uninstalls_all(self):
+        home = self.root / "home_legacy_repair_all"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        agy_json.write_text(json.dumps({}))
+
+        self.run_installer(home)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        legacy = json.loads(manifest_file.read_text())
+        legacy.pop("mutations", None)
+        legacy.pop("installed_snapshot", None)
+        manifest_file.write_text(json.dumps(legacy))
+
+        data = json.loads(agy_json.read_text())
+        del data["agterm-status"]["Stop"]
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home)
+        journal = json.loads(manifest_file.read_text()).get("mutations", [])
+        events = [(m["key"], m["event"]) for m in journal]
+        self.assertIn(("agterm-status", "Stop"), events)
+        self.assertIn(("agterm-status", "PreToolUse"), events)
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        self.assertEqual(result, {})
 
 
 if __name__ == "__main__":

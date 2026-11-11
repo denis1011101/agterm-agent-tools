@@ -550,9 +550,22 @@ def rollback_mutations(data, manifest):
             if not sub_info:
                 continue
 
+            orig_group = orig_status if key == "agterm-status" else orig_chat
+            orig_matchers = orig_group.get(event, []) if isinstance(orig_group, dict) else []
+
+            # Identify untouched original matchers to protect them from rollback
+            unconsumed_orig = list(orig_matchers)
+            protected_indices = set()
+            for c_idx, curr_m in enumerate(data[key][event]):
+                if curr_m in unconsumed_orig:
+                    protected_indices.add(c_idx)
+                    unconsumed_orig.remove(curr_m)
+
             target_m = None
             target_s_idx = -1
-            for curr_m in data[key][event]:
+            for c_idx, curr_m in enumerate(data[key][event]):
+                if c_idx in protected_indices:
+                    continue
                 if isinstance(curr_m, dict) and curr_m.get("matcher") == pattern and isinstance(curr_m.get("hooks"), list):
                     for s_idx, s_h in enumerate(curr_m["hooks"]):
                         if isinstance(s_h, dict) and "command" in s_h:
@@ -835,6 +848,10 @@ def derive_mutations(manifest, frag, home):
                                 mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h)})
     return mutations
 
+if existing_manifest and "mutations" not in existing_manifest:
+    existing_manifest["mutations"] = derive_mutations(existing_manifest, frag, home)
+    existing_manifest["installed_snapshot"] = copy.deepcopy(data)
+
 def group_has_our_hooks(group, frag_group):
     if not isinstance(group, dict):
         return False
@@ -881,13 +898,10 @@ already_up_to_date = (
 )
 
 if already_up_to_date and os.path.exists(manifest_file):
-    if "mutations" not in existing_manifest:
-        existing_manifest["mutations"] = derive_mutations(existing_manifest, frag, home)
-        existing_manifest["installed_snapshot"] = copy.deepcopy(data)
-        tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
-        with open(tmp_manifest, "w", encoding="utf-8") as f:
-            json.dump(existing_manifest, f, indent=2)
-        os.replace(tmp_manifest, manifest_file)
+    tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
+    with open(tmp_manifest, "w", encoding="utf-8") as f:
+        json.dump(existing_manifest, f, indent=2)
+    os.replace(tmp_manifest, manifest_file)
     sys.exit(0)
 
 # Create unique exclusive backup before mutating existing configuration
