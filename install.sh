@@ -332,6 +332,26 @@ def get_managed_hook_info(cmd_str):
         }
     return None
 
+def score_matcher_similarity(curr_m, orig_m):
+    curr_subs = curr_m.get("hooks", []) if isinstance(curr_m.get("hooks"), list) else []
+    orig_subs = orig_m.get("hooks", []) if isinstance(orig_m.get("hooks"), list) else []
+    score = 0
+    for cs in curr_subs:
+        if cs in orig_subs:
+            score += 100
+        elif isinstance(cs, dict) and "command" in cs:
+            cs_info = get_managed_hook_info(cs["command"])
+            for os_item in orig_subs:
+                if isinstance(os_item, dict) and "command" in os_item:
+                    os_info = get_managed_hook_info(os_item["command"])
+                    if cs_info and os_info:
+                        if cs_info["binary"] == os_info["binary"] and cs_info["canonical"] == os_info["canonical"]:
+                            score += 50
+                    elif not cs_info and not os_info:
+                        if cs["command"] == os_item["command"]:
+                            score += 80
+    return score
+
 def reconcile_hook_list(curr_list, orig_list):
     curr_list = curr_list if isinstance(curr_list, list) else []
     orig_list = orig_list if isinstance(orig_list, list) else []
@@ -356,15 +376,19 @@ def reconcile_hook_list(curr_list, orig_list):
 
         # 2. Matcher handling
         if "matcher" in curr_item and isinstance(curr_item.get("hooks"), list):
-            m_idx = -1
+            best_idx = -1
+            best_score = -1
             for i, om in enumerate(orig_list):
                 if not orig_consumed[i] and isinstance(om, dict) and om.get("matcher") == curr_item.get("matcher"):
-                    m_idx = i
-                    break
+                    s = score_matcher_similarity(curr_item, om)
+                    if s > best_score:
+                        best_score = s
+                        best_idx = i
+
             orig_subs = []
-            if m_idx != -1:
-                orig_consumed[m_idx] = True
-                orig_subs = orig_list[m_idx].get("hooks", []) if isinstance(orig_list[m_idx].get("hooks"), list) else []
+            if best_idx != -1:
+                orig_consumed[best_idx] = True
+                orig_subs = orig_list[best_idx].get("hooks", []) if isinstance(orig_list[best_idx].get("hooks"), list) else []
 
             filtered_subs = reconcile_hook_list(curr_item["hooks"], orig_subs)
             if filtered_subs:

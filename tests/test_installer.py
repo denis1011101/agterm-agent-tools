@@ -472,6 +472,41 @@ class TestInstaller(unittest.TestCase):
         self.run_installer(home, args=["--uninstall"])
         self.assertEqual(json.loads(agy_json.read_text()), original)
 
+    def test_multiple_matchers_reorder_and_user_edit_preserved_on_uninstall(self):
+        home = self.root / "home_reorder_edit_matchers"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        pattern = "ask_question|ask_permission"
+        ask_cmd = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" ask"
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": ask_cmd, "timeout": 40}]},
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        matchers = data["agterm-status"]["PreToolUse"]
+        matchers.reverse()
+        matchers[0]["hooks"][0]["timeout"] = 50
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        expected = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": ask_cmd, "timeout": 50}]},
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                ]
+            }
+        }
+        self.assertEqual(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
