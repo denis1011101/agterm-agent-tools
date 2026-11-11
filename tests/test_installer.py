@@ -897,6 +897,76 @@ class TestInstaller(unittest.TestCase):
         self.assertEqual(agy_json.read_bytes(), before_bytes)
         self.assertTrue(manifest_file.exists())
 
+    def test_user_appends_matcher_when_current_outnumbers_original(self):
+        home = self.root / "home_n_curr_greater_n_orig"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        # Append an extra user matcher of the same pattern
+        data["agterm-status"]["PreToolUse"].append(
+            {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo KEEP_ME"}]}
+        )
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        after = json.loads(agy_json.read_text())
+        expected = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo KEEP_ME"}]},
+                ]
+            }
+        }
+        self.assertEqual(after, expected)
+
+    def test_tied_ownership_with_pads_preserves_configuration(self):
+        home = self.root / "home_tied_with_pads"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    copy.deepcopy(matcher),
+                ]
+            }
+        }
+        for i in range(5):
+            pad = copy.deepcopy(matcher)
+            pad["hooks"][0]["timeout"] = 40 + i
+            pad["hooks"].append({"type": "command", "command": f"echo PAD_{i}"})
+            original["agterm-status"]["PreToolUse"].append(pad)
+
+        agy_json.write_text(json.dumps(original))
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        items = data["agterm-status"]["PreToolUse"]
+        items[0]["hooks"][0]["command"] = "echo UPDATED"
+        items[0], items[1] = items[1], items[0]
+        items[0]["hooks"].insert(0, {"type": "command", "command": "echo KEEP_ME"})
+        agy_json.write_text(json.dumps(data))
+
+        before_bytes = agy_json.read_bytes()
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(agy_json.read_bytes(), before_bytes)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        self.assertTrue(manifest_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

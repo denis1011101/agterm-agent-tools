@@ -659,76 +659,53 @@ def rollback_mutations(data, manifest):
             n_curr = len(curr_matchers)
             n_orig = len(orig_matchers)
 
-            # Prune matchers without canonical hook and not matching target_hooks
+            # Filter out untouched matchers that are identical between current and original
+            unmatched_orig = list(orig_matchers)
+            rel_curr = []
+            for c_idx, cm in curr_matchers:
+                matched_om = None
+                for om in unmatched_orig:
+                    if cm == om:
+                        matched_om = om
+                        break
+                if matched_om is not None:
+                    unmatched_orig.remove(matched_om)
+                else:
+                    rel_curr.append((c_idx, cm))
+
+            if len(rel_curr) < len(curr_matchers) and rel_curr and unmatched_orig:
+                curr_matchers = rel_curr
+                orig_matchers = unmatched_orig
+                n_curr = len(curr_matchers)
+                n_orig = len(orig_matchers)
+
+            # If still above exact-search limit, safely abort to preserve configuration
             if n_curr > 6 or n_orig > 6:
-                def is_relevant_cm(cm):
-                    cm_hooks = cm.get("hooks", []) if isinstance(cm.get("hooks"), list) else []
-                    has_canonical = any(
-                        isinstance(h, dict) and "command" in h and (get_managed_hook_info(h["command"]) or {}).get("canonical") == sub_info["canonical"]
-                        for h in cm_hooks
-                    )
-                    has_target = target_hooks and any(th in cm_hooks for th in target_hooks)
-                    return has_canonical or has_target
-
-                def is_relevant_om(om):
-                    om_hooks = om.get("hooks", []) if isinstance(om.get("hooks"), list) else []
-                    has_canonical = any(
-                        isinstance(h, dict) and "command" in h and (get_managed_hook_info(h["command"]) or {}).get("canonical") == sub_info["canonical"]
-                        for h in om_hooks
-                    )
-                    has_target = target_hooks and any(th in om_hooks for th in target_hooks)
-                    return has_canonical or has_target
-
-                rel_curr_matchers = [(c_idx, cm) for c_idx, cm in curr_matchers if is_relevant_cm(cm)]
-                rel_orig_matchers = [om for om in orig_matchers if is_relevant_om(om)]
-                if rel_curr_matchers and rel_orig_matchers:
-                    curr_matchers = rel_curr_matchers
-                    orig_matchers = rel_orig_matchers
-                    n_curr = len(curr_matchers)
-                    n_orig = len(orig_matchers)
+                sys.exit(10)
 
             best_score = -1
             best_mappings = []
 
-            if n_curr > 6 or n_orig > 6:
-                pair_scores = []
-                for c_i in range(n_curr):
-                    for o_i in range(n_orig):
-                        s = score_matcher_similarity(curr_matchers[c_i][1], orig_matchers[o_i])
-                        if target_hooks is not None and any(th in curr_matchers[c_i][1].get("hooks", []) for th in target_hooks):
+            perm_gen = (
+                (list(zip(range(n_curr), subset)))
+                if n_curr <= n_orig
+                else (list(zip(subset, range(n_orig))))
+                for subset in (itertools.permutations(range(n_orig), n_curr) if n_curr <= n_orig else itertools.permutations(range(n_curr), n_orig))
+            )
+            for mapping in perm_gen:
+                tot = 0
+                for c_i, o_i in mapping:
+                    s = score_matcher_similarity(curr_matchers[c_i][1], orig_matchers[o_i])
+                    if target_hooks is not None:
+                        c_h = curr_matchers[c_i][1].get("hooks", [])
+                        if any(th in c_h for th in target_hooks):
                             s += 1000
-                        pair_scores.append((s, c_i, o_i))
-                pair_scores.sort(key=lambda x: x[0], reverse=True)
-                greedy_mapping = []
-                used_c = set()
-                used_o = set()
-                for s, c_i, o_i in pair_scores:
-                    if c_i not in used_c and o_i not in used_o:
-                        greedy_mapping.append((c_i, o_i))
-                        used_c.add(c_i)
-                        used_o.add(o_i)
-                best_mappings = [greedy_mapping]
-            else:
-                perm_gen = (
-                    (list(zip(range(n_curr), o_subset)))
-                    if n_curr <= n_orig
-                    else (list(zip(c_subset, range(n_orig))))
-                    for o_subset in (itertools.permutations(range(n_orig), n_curr) if n_curr <= n_orig else itertools.permutations(range(n_curr), n_orig))
-                )
-                for mapping in perm_gen:
-                    tot = 0
-                    for c_i, o_i in mapping:
-                        s = score_matcher_similarity(curr_matchers[c_i][1], orig_matchers[o_i])
-                        if target_hooks is not None:
-                            c_h = curr_matchers[c_i][1].get("hooks", [])
-                            if any(th in c_h for th in target_hooks):
-                                s += 1000
-                        tot += s
-                    if tot > best_score:
-                        best_score = tot
-                        best_mappings = [mapping]
-                    elif tot == best_score:
-                        best_mappings.append(mapping)
+                    tot += s
+                if tot > best_score:
+                    best_score = tot
+                    best_mappings = [mapping]
+                elif tot == best_score:
+                    best_mappings.append(mapping)
 
             if not best_mappings:
                 continue
