@@ -749,6 +749,122 @@ class TestInstaller(unittest.TestCase):
         result = json.loads(agy_json.read_text())
         self.assertEqual(result, expected)
 
+    def test_combined_custom_edits_preserve_original_ask(self):
+        home = self.root / "home_combined_custom_edits"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    copy.deepcopy(matcher),
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["PreToolUse"][0]["hooks"][0]["command"] = "echo UPDATED"
+        data["agterm-status"]["PreToolUse"].reverse()
+        custom = {"type": "command", "command": "echo KEEP_ME"}
+        data["agterm-status"]["PreToolUse"][0]["hooks"].append(custom)
+        agy_json.write_text(json.dumps(data))
+
+        expected = copy.deepcopy(original)
+        expected["agterm-status"]["PreToolUse"][0]["hooks"][0]["command"] = "echo UPDATED"
+        expected["agterm-status"]["PreToolUse"].reverse()
+        expected["agterm-status"]["PreToolUse"][0]["hooks"].append(custom)
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        self.assertEqual(result, expected)
+
+    def test_add_matcher_rolls_back_installed_matcher_after_user_prepend(self):
+        home = self.root / "home_prepend_user_matcher"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        agy_json.write_text(json.dumps({}))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        custom = {"type": "command", "command": "echo KEEP_ME"}
+        user_matcher = {"matcher": matcher["matcher"], "hooks": [custom]}
+        data["agterm-status"]["PreToolUse"].insert(0, user_matcher)
+        agy_json.write_text(json.dumps(data))
+
+        expected = {"agterm-status": {"PreToolUse": [user_matcher]}}
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        self.assertEqual(result, expected)
+
+    def test_matrix_rename_reorder_append_remove_combinations(self):
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+
+        # Combinations: (rename_custom, reorder_matchers, append_custom, remove_installer_hook)
+        cases = [
+            (True, False, False, False),  # rename only
+            (True, True, False, False),   # rename + reorder
+            (True, False, True, False),   # rename + append
+            (True, True, True, False),    # rename + reorder + append
+            (False, True, False, True),   # reorder + remove
+            (True, True, True, True),     # rename + reorder + append + remove
+        ]
+
+        for idx, (do_rename, do_reorder, do_append, do_remove) in enumerate(cases):
+            case_name = f"matrix_{idx}_ren{int(do_rename)}_reo{int(do_reorder)}_app{int(do_append)}_rem{int(do_remove)}"
+            home = self.root / case_name
+            agy_json = home / ".gemini/config/hooks.json"
+            agy_json.parent.mkdir(parents=True)
+            original = {
+                "agterm-status": {
+                    "PreToolUse": [
+                        {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                        copy.deepcopy(matcher),
+                    ]
+                }
+            }
+            agy_json.write_text(json.dumps(original))
+
+            self.run_installer(home)
+            data = json.loads(agy_json.read_text())
+
+            # Mutations after install
+            if do_rename:
+                data["agterm-status"]["PreToolUse"][0]["hooks"][0]["command"] = "echo UPDATED"
+            if do_remove:
+                # Remove the installer-added hook from matcher 0
+                data["agterm-status"]["PreToolUse"][0]["hooks"] = [
+                    h for h in data["agterm-status"]["PreToolUse"][0]["hooks"]
+                    if not (isinstance(h, dict) and "agy-status-hook.sh" in h.get("command", ""))
+                ]
+            if do_reorder:
+                data["agterm-status"]["PreToolUse"].reverse()
+            if do_append:
+                target_idx = 0 if do_reorder else 1
+                data["agterm-status"]["PreToolUse"][target_idx]["hooks"].append({"type": "command", "command": "echo EXTRA"})
+
+            agy_json.write_text(json.dumps(data))
+
+            # Calculate expected
+            expected = copy.deepcopy(original)
+            if do_rename:
+                expected["agterm-status"]["PreToolUse"][0]["hooks"][0]["command"] = "echo UPDATED"
+            if do_reorder:
+                expected["agterm-status"]["PreToolUse"].reverse()
+            if do_append:
+                target_idx = 0 if do_reorder else 1
+                expected["agterm-status"]["PreToolUse"][target_idx]["hooks"].append({"type": "command", "command": "echo EXTRA"})
+
+            self.run_installer(home, args=["--uninstall"])
+            result = json.loads(agy_json.read_text())
+            self.assertEqual(result, expected, f"Failed case {case_name}")
+
 
 if __name__ == "__main__":
     unittest.main()

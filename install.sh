@@ -332,39 +332,71 @@ def get_managed_hook_info(cmd_str):
         }
     return None
 
+def get_hook_kind(h):
+    if not isinstance(h, dict) or "command" not in h:
+        return None
+    info = get_managed_hook_info(h["command"])
+    if info:
+        return ("managed", info["binary"], info["canonical"])
+    return "custom"
+
 def score_matcher_similarity(curr_m, orig_m):
     curr_subs = curr_m.get("hooks", []) if isinstance(curr_m.get("hooks"), list) else []
     orig_subs = orig_m.get("hooks", []) if isinstance(orig_m.get("hooks"), list) else []
     score = 0
     if curr_m == orig_m:
-        score += 5000
+        score += 10000
 
-    curr_has_custom = any(isinstance(cs, dict) and "command" in cs and not get_managed_hook_info(cs["command"]) for cs in curr_subs)
-    orig_has_custom = any(isinstance(os_item, dict) and "command" in os_item and not get_managed_hook_info(os_item["command"]) for os_item in orig_subs)
-    if curr_has_custom == orig_has_custom:
-        score += 150
+    curr_kinds = [get_hook_kind(h) for h in curr_subs]
+    orig_kinds = [get_hook_kind(h) for h in orig_subs]
 
-    for cs in curr_subs:
+    # Exact kind sequence match
+    if curr_kinds == orig_kinds:
+        score += 1500
+    # Prefix match
+    elif len(orig_kinds) <= len(curr_kinds) and curr_kinds[:len(orig_kinds)] == orig_kinds:
+        score += 800
+
+    # Custom command position match
+    curr_has_custom = "custom" in curr_kinds
+    orig_has_custom = "custom" in orig_kinds
+    if curr_has_custom and orig_has_custom:
+        score += 200
+        if curr_kinds.index("custom") == orig_kinds.index("custom"):
+            score += 400
+    elif not curr_has_custom and not orig_has_custom:
+        score += 200
+
+    for c_idx, cs in enumerate(curr_subs):
         if not isinstance(cs, dict):
             if cs in orig_subs:
                 score += 100
             continue
         cs_info = get_managed_hook_info(cs.get("command", ""))
         if cs in orig_subs:
+            o_idx = orig_subs.index(cs)
             if not cs_info:
-                score += 1000
+                score += 2000
+                if c_idx == o_idx:
+                    score += 500
             else:
                 score += 200
+                if c_idx == o_idx:
+                    score += 500
         elif "command" in cs:
-            for os_item in orig_subs:
+            for o_idx, os_item in enumerate(orig_subs):
                 if isinstance(os_item, dict) and "command" in os_item:
                     os_info = get_managed_hook_info(os_item["command"])
                     if cs_info and os_info:
                         if cs_info["binary"] == os_info["binary"] and cs_info["canonical"] == os_info["canonical"]:
                             score += 50
+                            if c_idx == o_idx:
+                                score += 50
                     elif not cs_info and not os_info:
                         if cs["command"] == os_item["command"]:
-                            score += 800
+                            score += 1500
+                            if c_idx == o_idx:
+                                score += 300
     return score
 
 def reconcile_hook_list(curr_list, orig_list):
@@ -543,23 +575,45 @@ def rollback_mutations(data, manifest):
                         break
         elif m_type == "add_matcher":
             pattern = m["matcher"].get("matcher")
+            m_hooks = m["matcher"].get("hooks", [])
+            m_managed_canonicals = set()
+            for mh in m_hooks:
+                if isinstance(mh, dict) and "command" in mh:
+                    info = get_managed_hook_info(mh["command"])
+                    if info:
+                        m_managed_canonicals.add((info["binary"], info["canonical"]))
+
+            target_idx = -1
             for idx, curr_m in enumerate(data[key][event]):
                 if isinstance(curr_m, dict) and curr_m.get("matcher") == pattern:
-                    has_custom = any(
-                        isinstance(sh, dict) and not get_managed_hook_info(sh.get("command", ""))
-                        for sh in curr_m.get("hooks", [])
-                    )
-                    if not has_custom:
-                        del data[key][event][idx]
-                        changed = True
+                    curr_canonicals = set()
+                    for sh in curr_m.get("hooks", []):
+                        if isinstance(sh, dict) and "command" in sh:
+                            info = get_managed_hook_info(sh["command"])
+                            if info:
+                                curr_canonicals.add((info["binary"], info["canonical"]))
+                    if m_managed_canonicals and m_managed_canonicals.issubset(curr_canonicals):
+                        target_idx = idx
                         break
-                    else:
-                        curr_m["hooks"] = [
-                            sh for sh in curr_m.get("hooks", [])
-                            if not (isinstance(sh, dict) and get_managed_hook_info(sh.get("command", "")))
-                        ]
-                        changed = True
+                    elif not m_managed_canonicals and curr_m == m["matcher"]:
+                        target_idx = idx
                         break
+
+            if target_idx != -1:
+                curr_m = data[key][event][target_idx]
+                has_custom = any(
+                    isinstance(sh, dict) and not get_managed_hook_info(sh.get("command", ""))
+                    for sh in curr_m.get("hooks", [])
+                )
+                if not has_custom:
+                    del data[key][event][target_idx]
+                    changed = True
+                else:
+                    curr_m["hooks"] = [
+                        sh for sh in curr_m.get("hooks", [])
+                        if not (isinstance(sh, dict) and get_managed_hook_info(sh.get("command", "")))
+                    ]
+                    changed = True
         elif m_type == "add_sub":
             pattern = m["pattern"]
             sub_info = get_managed_hook_info(m["hook"].get("command", ""))
@@ -585,8 +639,6 @@ def rollback_mutations(data, manifest):
             for c_i, (c_idx, cm) in enumerate(curr_matchers):
                 for o_i, om in enumerate(orig_matchers):
                     s = score_matcher_similarity(cm, om)
-                    if c_i == o_i:
-                        s += 50
                     pair_scores.append((s, c_i, o_i))
 
             pair_scores.sort(key=lambda x: x[0], reverse=True)
@@ -664,7 +716,7 @@ def rollback_mutations(data, manifest):
                                     best_target_m = cm
                                     best_target_s_idx = s_idx
 
-            if best_target_m is not None and best_target_s_idx != -1:
+            if best_target_m is not None and best_target_s_idx != -1 and best_candidate_score > 0:
                 del best_target_m["hooks"][best_target_s_idx]
                 changed = True
         elif m_type == "upgrade_sub":
