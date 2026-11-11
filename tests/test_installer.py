@@ -574,6 +574,95 @@ class TestInstaller(unittest.TestCase):
         }
         self.assertEqual(result, expected)
 
+    def test_user_deleted_installer_child_leaves_original_matcher_intact_on_uninstall(self):
+        home = self.root / "home_deleted_installer_child"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        pattern = "ask_question|ask_permission"
+        ask_cmd = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" ask"
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": ask_cmd, "timeout": 40}]},
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        del data["agterm-status"]["PreToolUse"][0]["hooks"][1]
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        self.assertEqual(result, original)
+
+    def test_reinstall_mutation_recorded_and_removed_on_uninstall(self):
+        home = self.root / "home_reinstall_mutation"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        stop_cmd = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" stop"
+        original = {"agterm-status": {"Stop": [{"type": "command", "command": stop_cmd, "timeout": 40}]}}
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        before = json.loads(manifest_file.read_text())["mutations"]
+
+        data = json.loads(agy_json.read_text())
+        del data["agterm-status"]["Stop"]
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home)
+        after = json.loads(manifest_file.read_text())["mutations"]
+        self.assertTrue(any(m.get("event") == "Stop" for m in after))
+        self.assertNotEqual(before, after)
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        self.assertFalse(result.get("agterm-status", {}).get("Stop"))
+
+    def test_legacy_manifest_migration_and_provenance_preservation(self):
+        home = self.root / "home_legacy_manifest_migration"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        pattern = "ask_question|ask_permission"
+        ask_cmd = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" ask"
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": "echo ORIGINAL"}]},
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": ask_cmd, "timeout": 40}]},
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        legacy = json.loads(manifest_file.read_text())
+        legacy.pop("mutations", None)
+        legacy.pop("installed_snapshot", None)
+        manifest_file.write_text(json.dumps(legacy))
+
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["PreToolUse"][0]["hooks"][0]["command"] = "echo UPDATED"
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home)
+        self.assertIn("mutations", json.loads(manifest_file.read_text()))
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        has_ask40 = any(
+            sh.get("timeout") == 40
+            for m in result.get("agterm-status", {}).get("PreToolUse", [])
+            for sh in m.get("hooks", [])
+        )
+        self.assertTrue(has_ask40)
+
 
 if __name__ == "__main__":
     unittest.main()

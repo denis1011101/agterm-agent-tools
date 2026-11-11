@@ -428,6 +428,63 @@ def reconcile_hook_list(curr_list, orig_list):
 
 uninstall_event_list = reconcile_hook_list
 
+def derive_mutations(manifest, frag, home):
+    mutations = []
+    orig_status = manifest.get("original_agterm_status")
+    orig_chat = manifest.get("original_mailbox_chat")
+    orig = {
+        "agterm-status": orig_status if isinstance(orig_status, dict) else {},
+        "mailbox-chat": orig_chat if isinstance(orig_chat, dict) else {}
+    }
+
+    for key, frag_group in frag.items():
+        if not isinstance(frag_group, dict):
+            continue
+        orig_group = orig.get(key, {})
+        for event_name, hook_list in frag_group.items():
+            if not isinstance(hook_list, list):
+                continue
+            orig_event_list = orig_group.get(event_name, []) if isinstance(orig_group, dict) else []
+            for h in hook_list:
+                if not isinstance(h, dict):
+                    continue
+                if "command" in h:
+                    h_info = get_managed_hook_info(h["command"])
+                    if not h_info:
+                        continue
+                    found_orig = False
+                    for om in orig_event_list:
+                        if isinstance(om, dict) and "command" in om:
+                            om_info = get_managed_hook_info(om["command"])
+                            if om_info and om_info["binary"] == h_info["binary"] and om_info["canonical"] == h_info["canonical"]:
+                                if om_info["is_legacy"]:
+                                    mutations.append({"type": "upgrade_direct", "key": key, "event": event_name, "from": copy.deepcopy(om), "to": copy.deepcopy(h)})
+                                found_orig = True
+                                break
+                    if not found_orig:
+                        mutations.append({"type": "add_direct", "key": key, "event": event_name, "hook": copy.deepcopy(h)})
+                elif "matcher" in h and "hooks" in h:
+                    pattern = h.get("matcher")
+                    matching_orig = [
+                        (idx, om) for idx, om in enumerate(orig_event_list)
+                        if isinstance(om, dict) and om.get("matcher") == pattern
+                    ]
+                    if not matching_orig:
+                        mutations.append({"type": "add_matcher", "key": key, "event": event_name, "matcher": copy.deepcopy(h)})
+                    else:
+                        for sub_h in h.get("hooks", []):
+                            sub_info = get_managed_hook_info(sub_h.get("command", ""))
+                            if not sub_info:
+                                continue
+                            first_m_idx, first_m = matching_orig[0]
+                            first_has = any(
+                                isinstance(sh, dict) and (get_managed_hook_info(sh.get("command", "")) or {}).get("canonical") == sub_info["canonical"]
+                                for sh in first_m.get("hooks", [])
+                            )
+                            if not first_has:
+                                mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h)})
+    return mutations
+
 def rollback_mutations(data, manifest):
     mutations = manifest.get("mutations", [])
     if not mutations:
@@ -505,10 +562,7 @@ def rollback_mutations(data, manifest):
                                     target_m = curr_m
                                     target_s_idx = s_idx
                                     break
-                                elif target_m is None:
-                                    target_m = curr_m
-                                    target_s_idx = s_idx
-                    if target_s_idx != -1 and target_m.get("hooks", [])[target_s_idx].get("timeout") == m["hook"].get("timeout"):
+                    if target_s_idx != -1:
                         break
 
             if target_m is not None and target_s_idx != -1:
@@ -555,6 +609,14 @@ def rollback_mutations(data, manifest):
     return changed
 
 changed = False
+
+if "mutations" not in manifest:
+    try:
+        with open(fragment_path, "r", encoding="utf-8") as f:
+            frag = json.load(f)
+        manifest["mutations"] = derive_mutations(manifest, frag, home)
+    except Exception:
+        pass
 
 if manifest.get("mutations"):
     changed = rollback_mutations(data, manifest)
@@ -716,6 +778,63 @@ def get_managed_hook_info(cmd_str):
         }
     return None
 
+def derive_mutations(manifest, frag, home):
+    mutations = []
+    orig_status = manifest.get("original_agterm_status")
+    orig_chat = manifest.get("original_mailbox_chat")
+    orig = {
+        "agterm-status": orig_status if isinstance(orig_status, dict) else {},
+        "mailbox-chat": orig_chat if isinstance(orig_chat, dict) else {}
+    }
+
+    for key, frag_group in frag.items():
+        if not isinstance(frag_group, dict):
+            continue
+        orig_group = orig.get(key, {})
+        for event_name, hook_list in frag_group.items():
+            if not isinstance(hook_list, list):
+                continue
+            orig_event_list = orig_group.get(event_name, []) if isinstance(orig_group, dict) else []
+            for h in hook_list:
+                if not isinstance(h, dict):
+                    continue
+                if "command" in h:
+                    h_info = get_managed_hook_info(h["command"])
+                    if not h_info:
+                        continue
+                    found_orig = False
+                    for om in orig_event_list:
+                        if isinstance(om, dict) and "command" in om:
+                            om_info = get_managed_hook_info(om["command"])
+                            if om_info and om_info["binary"] == h_info["binary"] and om_info["canonical"] == h_info["canonical"]:
+                                if om_info["is_legacy"]:
+                                    mutations.append({"type": "upgrade_direct", "key": key, "event": event_name, "from": copy.deepcopy(om), "to": copy.deepcopy(h)})
+                                found_orig = True
+                                break
+                    if not found_orig:
+                        mutations.append({"type": "add_direct", "key": key, "event": event_name, "hook": copy.deepcopy(h)})
+                elif "matcher" in h and "hooks" in h:
+                    pattern = h.get("matcher")
+                    matching_orig = [
+                        (idx, om) for idx, om in enumerate(orig_event_list)
+                        if isinstance(om, dict) and om.get("matcher") == pattern
+                    ]
+                    if not matching_orig:
+                        mutations.append({"type": "add_matcher", "key": key, "event": event_name, "matcher": copy.deepcopy(h)})
+                    else:
+                        for sub_h in h.get("hooks", []):
+                            sub_info = get_managed_hook_info(sub_h.get("command", ""))
+                            if not sub_info:
+                                continue
+                            first_m_idx, first_m = matching_orig[0]
+                            first_has = any(
+                                isinstance(sh, dict) and (get_managed_hook_info(sh.get("command", "")) or {}).get("canonical") == sub_info["canonical"]
+                                for sh in first_m.get("hooks", [])
+                            )
+                            if not first_has:
+                                mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h)})
+    return mutations
+
 def group_has_our_hooks(group, frag_group):
     if not isinstance(group, dict):
         return False
@@ -762,6 +881,13 @@ already_up_to_date = (
 )
 
 if already_up_to_date and os.path.exists(manifest_file):
+    if "mutations" not in existing_manifest:
+        existing_manifest["mutations"] = derive_mutations(existing_manifest, frag, home)
+        existing_manifest["installed_snapshot"] = copy.deepcopy(data)
+        tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
+        with open(tmp_manifest, "w", encoding="utf-8") as f:
+            json.dump(existing_manifest, f, indent=2)
+        os.replace(tmp_manifest, manifest_file)
     sys.exit(0)
 
 # Create unique exclusive backup before mutating existing configuration
@@ -844,7 +970,13 @@ for key, frag_group in frag.items():
                             data[key][event_name].append(copy.deepcopy(h))
                             mutations.append({"type": "add_matcher", "key": key, "event": event_name, "matcher": copy.deepcopy(h)})
 
-manifest["mutations"] = existing_manifest.get("mutations", mutations)
+existing_mutations = existing_manifest.get("mutations", [])
+combined_mutations = list(existing_mutations)
+for m in mutations:
+    if m not in combined_mutations:
+        combined_mutations.append(m)
+
+manifest["mutations"] = combined_mutations
 manifest["installed_snapshot"] = copy.deepcopy(data)
 
 tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
