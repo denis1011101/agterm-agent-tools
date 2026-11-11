@@ -324,6 +324,55 @@ class TestInstaller(unittest.TestCase):
         self.assertEqual(len(stop_hooks), 1)
         self.assertEqual(stop_hooks[0]["command"], expected_stop)
 
+    def test_foreign_same_action_hook_preserved_and_restored(self):
+        home = self.root / "home_foreign_same_action"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        original = {
+            "mailbox-chat": {
+                "PreInvocation": [
+                    {"type": "command", "command": "/custom/mailbox-chat.py agy-hook", "timeout": 40}
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        cmds = [h["command"] for h in data["mailbox-chat"]["PreInvocation"]]
+        self.assertIn("/custom/mailbox-chat.py agy-hook", cmds)
+        self.assertIn("\"$HOME/.local/bin/mailbox-chat.py\" agy-hook", cmds)
+
+        self.run_installer(home, args=["--uninstall"])
+        restored = json.loads(agy_json.read_text())
+        self.assertEqual(restored, original)
+
+    def test_custom_timeout_on_managed_hook_preserved(self):
+        home = self.root / "home_custom_timeout"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["Stop"][0]["timeout"] = 40
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home)
+        reinstalled = json.loads(agy_json.read_text())
+        self.assertEqual(reinstalled["agterm-status"]["Stop"][0].get("timeout"), 40)
+
+    def test_preflight_validation_aborts_before_symlinks(self):
+        home = self.root / "home_preflight_abort"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        agy_json.write_text("{malformed_json: true,")
+
+        self.run_installer(home, expect_fail=True)
+        # Verify no symlinks or directories were created in .local/bin
+        bin_target = home / ".local/bin/mailbox-chat.py"
+        self.assertFalse(bin_target.exists())
+        self.assertFalse((home / ".local/state/agterm-agent-tools/manifest.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
