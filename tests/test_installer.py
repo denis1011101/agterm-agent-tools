@@ -193,6 +193,79 @@ class TestInstaller(unittest.TestCase):
             restored = json.load(f)
         self.assertEqual(restored, custom_data)
 
+    def test_post_install_user_edit_preserved_on_uninstall(self):
+        home = self.root / "home_post_edit"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        custom_data = {
+            "mailbox-chat": {"custom": "ORIGINAL"},
+            "agterm-status": {"custom": "ORIGINAL"},
+            "other": {"keep": True}
+        }
+        agy_json.write_text(json.dumps(custom_data))
+
+        self.run_installer(home)
+        current = json.loads(agy_json.read_text())
+        current["mailbox-chat"]["my-added-hook"] = {"command": "echo KEEP_ME"}
+        agy_json.write_text(json.dumps(current))
+
+        self.run_installer(home, args=["--uninstall"])
+        res = json.loads(agy_json.read_text())
+        self.assertIn("my-added-hook", res["mailbox-chat"])
+        self.assertEqual(res["mailbox-chat"].get("custom"), "ORIGINAL")
+        self.assertEqual(res["agterm-status"].get("custom"), "ORIGINAL")
+
+    def test_reinstall_preserves_original_manifest_and_restores_original(self):
+        home = self.root / "home_reinstall_manifest"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        orig_data = {
+            "mailbox-chat": {"custom": "ORIGINAL"},
+            "agterm-status": {"custom": "ORIGINAL"},
+            "other": {"keep": True}
+        }
+        agy_json.write_text(json.dumps(orig_data))
+
+        self.run_installer(home)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        before = json.loads(manifest_file.read_text())
+
+        # User adds extra hook
+        current = json.loads(agy_json.read_text())
+        current["mailbox-chat"]["my-added-hook"] = {"command": "echo KEEP_ME"}
+        agy_json.write_text(json.dumps(current))
+
+        # Reinstall
+        self.run_installer(home)
+        after = json.loads(manifest_file.read_text())
+        self.assertEqual(before["original_mailbox_chat"], after["original_mailbox_chat"])
+
+        # Clean user extra hook and uninstall
+        current = json.loads(agy_json.read_text())
+        del current["mailbox-chat"]["my-added-hook"]
+        agy_json.write_text(json.dumps(current))
+
+        self.run_installer(home, args=["--uninstall"])
+        restored = json.loads(agy_json.read_text())
+        self.assertEqual(restored["mailbox-chat"], orig_data["mailbox-chat"])
+        self.assertEqual(restored["agterm-status"], orig_data["agterm-status"])
+
+    def test_corrupt_manifest_aborts_without_modifying_config(self):
+        home = self.root / "home_corrupt_manifest"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        custom_data = {"mailbox-chat": {"keep": True}}
+        agy_json.write_text(json.dumps(custom_data))
+
+        self.run_installer(home)
+        before_content = agy_json.read_text()
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        manifest_file.write_text("{broken")
+
+        self.run_installer(home, args=["--uninstall"], expect_fail=True)
+        self.assertEqual(agy_json.read_text(), before_content)
+        self.assertTrue(manifest_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

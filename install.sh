@@ -119,7 +119,6 @@ make_symlink() {
         else
             log_action "Updating symlink: $dest -> $src"
             if (( ! DRY_RUN )); then
-                # Remove old symlink first so ln doesn't write into target if it was a directory
                 rm -f "$dest"
                 ln -s "$src" "$dest"
             fi
@@ -197,10 +196,10 @@ manage_agy_hooks_json() {
 
     if (( UNINSTALL )); then
         if [[ -f "$manifest_file" ]]; then
-            log_action "Reverting managed AGY lifecycle hooks from $target_json via manifest"
+            log_action "Removing managed AGY lifecycle hooks via manifest from $target_json"
             if (( ! DRY_RUN )); then
                 python3 -c '
-import json, sys, os
+import json, sys, os, copy
 
 target_path = sys.argv[1]
 manifest_file = sys.argv[2]
@@ -211,40 +210,77 @@ if not os.path.exists(manifest_file):
 try:
     with open(manifest_file, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-except Exception:
-    manifest = {}
+except Exception as e:
+    sys.exit(f"Error: Manifest {manifest_file} is corrupted ({e}). Aborting uninstall to protect configurations.")
 
-if os.path.exists(target_path):
+if not isinstance(manifest, dict):
+    sys.exit(f"Error: Manifest {manifest_file} has invalid schema. Aborting uninstall.")
+
+if not os.path.exists(target_path):
     try:
-        with open(target_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = None
+        os.remove(manifest_file)
+    except OSError:
+        pass
+    sys.exit(0)
 
-    if isinstance(data, dict):
-        changed = False
-        orig_status = manifest.get("original_agterm_status")
-        if orig_status is not None:
-            data["agterm-status"] = orig_status
-            changed = True
-        elif "agterm-status" in data:
-            del data["agterm-status"]
-            changed = True
+try:
+    with open(target_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    sys.exit(f"Error: Target {target_path} contains unreadable or malformed JSON ({e}). Aborting uninstall.")
 
-        orig_mb = manifest.get("original_mailbox_chat")
-        if orig_mb is not None:
-            data["mailbox-chat"] = orig_mb
-            changed = True
-        elif "mailbox-chat" in data:
-            del data["mailbox-chat"]
-            changed = True
+if not isinstance(data, dict):
+    sys.exit(f"Error: Target {target_path} root is not a JSON object. Aborting uninstall.")
 
-        if changed:
-            tmp_target = f"{target_path}.tmp.{os.getpid()}"
-            with open(tmp_target, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                f.write("\n")
-            os.replace(tmp_target, target_path)
+def is_our_hook(item):
+    if not isinstance(item, dict):
+        return False
+    cmd = item.get("command", "")
+    if "agy-status-hook.sh" in cmd or "mailbox-chat.py" in cmd:
+        return True
+    nested = item.get("hooks")
+    if isinstance(nested, list):
+        for sub in nested:
+            if isinstance(sub, dict) and ("agy-status-hook.sh" in sub.get("command", "") or "mailbox-chat.py" in sub.get("command", "")):
+                return True
+    return False
+
+changed = False
+
+for key in ["agterm-status", "mailbox-chat"]:
+    if key in data:
+        group = data[key]
+        if isinstance(group, dict):
+            clean_key = key.replace("-", "_")
+            orig_group = manifest.get("original_" + clean_key)
+            was_created = manifest.get("created_" + clean_key, False)
+            for event_name in list(group.keys()):
+                if isinstance(group[event_name], list):
+                    filtered = [h for h in group[event_name] if not is_our_hook(h)]
+                    if len(filtered) != len(group[event_name]):
+                        changed = True
+                    if filtered:
+                        group[event_name] = filtered
+                    else:
+                        if isinstance(orig_group, dict) and event_name in orig_group:
+                            group[event_name] = []
+                        else:
+                            del group[event_name]
+                            changed = True
+            # If nothing remains and group was created by our installer, remove the group
+            if was_created and not group:
+                del data[key]
+                changed = True
+            elif orig_group is not None and not group:
+                data[key] = copy.deepcopy(orig_group)
+                changed = True
+
+if changed:
+    tmp_target = f"{target_path}.tmp.{os.getpid()}"
+    with open(tmp_target, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp_target, target_path)
 
 try:
     os.remove(manifest_file)
@@ -268,7 +304,7 @@ except OSError:
     log_action "Merging AGY lifecycle hooks into $target_json"
     if (( ! DRY_RUN )); then
         python3 -c '
-import json, sys, shutil, time, uuid, os
+import json, sys, shutil, time, uuid, os, copy
 
 target_path = sys.argv[1]
 fragment_path = sys.argv[2]
@@ -292,13 +328,46 @@ if os.path.exists(target_path):
         except Exception as e:
             sys.exit(f"Error: {target_path} contains malformed or unreadable JSON ({e}). Aborting install to prevent data loss.")
 
-already_configured = (
-    data.get("agterm-status") == frag.get("agterm-status") and
-    data.get("mailbox-chat") == frag.get("mailbox-chat")
+def is_our_hook(item):
+    if not isinstance(item, dict):
+        return False
+    cmd = item.get("command", "")
+    if "agy-status-hook.sh" in cmd or "mailbox-chat.py" in cmd:
+        return True
+    nested = item.get("hooks")
+    if isinstance(nested, list):
+        for sub in nested:
+            if isinstance(sub, dict) and ("agy-status-hook.sh" in sub.get("command", "") or "mailbox-chat.py" in sub.get("command", "")):
+                return True
+    return False
+
+def group_has_our_hooks(group, frag_group):
+    if not isinstance(group, dict):
+        return False
+    for event_name, hook_list in frag_group.items():
+        if event_name not in group or not isinstance(group[event_name], list):
+            return False
+        for expected in hook_list:
+            if expected not in group[event_name]:
+                return False
+    return True
+
+already_up_to_date = (
+    group_has_our_hooks(data.get("agterm-status"), frag.get("agterm-status", {})) and
+    group_has_our_hooks(data.get("mailbox-chat"), frag.get("mailbox-chat", {}))
 )
-if already_configured:
-    # Already configured, no mutation needed
+
+if already_up_to_date and os.path.exists(manifest_file):
     sys.exit(0)
+
+# Load existing manifest if present to preserve initial pre-install values on reinstall
+existing_manifest = {}
+if os.path.exists(manifest_file):
+    try:
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            existing_manifest = json.load(f)
+    except Exception:
+        existing_manifest = {}
 
 # Create unique exclusive backup before mutating existing configuration
 if file_existed and data:
@@ -311,15 +380,32 @@ if file_existed and data:
 # Record manifest with original pre-install values
 os.makedirs(os.path.dirname(manifest_file), exist_ok=True)
 manifest = {
-    "file_existed": file_existed,
-    "original_agterm_status": data.get("agterm-status"),
-    "original_mailbox_chat": data.get("mailbox-chat"),
-    "installed_at": int(time.time())
+    "file_existed": existing_manifest.get("file_existed", file_existed),
+    "original_agterm_status": existing_manifest.get("original_agterm_status", copy.deepcopy(data.get("agterm-status"))),
+    "original_mailbox_chat": existing_manifest.get("original_mailbox_chat", copy.deepcopy(data.get("mailbox-chat"))),
+    "created_agterm_status": existing_manifest.get("created_agterm_status", "agterm-status" not in data),
+    "created_mailbox_chat": existing_manifest.get("created_mailbox_chat", "mailbox-chat" not in data),
+    "installed_at": existing_manifest.get("installed_at", int(time.time())),
+    "updated_at": int(time.time())
 }
-with open(manifest_file, "w", encoding="utf-8") as f:
-    json.dump(manifest, f, indent=2)
 
-data.update(frag)
+tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
+with open(tmp_manifest, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+os.replace(tmp_manifest, manifest_file)
+
+# Surgical merge: preserve custom keys inside each group, append our hooks to list
+for key, frag_group in frag.items():
+    if key not in data or not isinstance(data[key], dict):
+        data[key] = copy.deepcopy(frag_group)
+    else:
+        for event_name, hook_list in frag_group.items():
+            if event_name not in data[key] or not isinstance(data[key][event_name], list):
+                data[key][event_name] = copy.deepcopy(hook_list)
+            else:
+                for h in hook_list:
+                    if h not in data[key][event_name]:
+                        data[key][event_name].append(copy.deepcopy(h))
 
 tmp_target = f"{target_path}.tmp.{uuid.uuid4().hex}"
 with open(tmp_target, "w", encoding="utf-8") as f:
@@ -425,6 +511,31 @@ main() {
         log_info "Installing agterm-agent-tools..."
     fi
 
+    if (( UNINSTALL )); then
+        # On uninstall: run configuration cleanup first as preflight
+        log_info "Managing configurations (preflight check)..."
+        manage_agy_hooks_json
+        manage_codex_hooks
+        manage_agterm_hooks_conf
+
+        log_info "Managing agent skills..."
+        make_symlink "$SCRIPT_DIR/skills/agy/mailbox-chat"   "$HOME/.gemini/config/skills/mailbox-chat"
+        make_symlink "$SCRIPT_DIR/skills/codex/mailbox-chat" "$HOME/.codex/skills/mailbox-chat"
+
+        log_info "Managing hook scripts..."
+        make_symlink "$SCRIPT_DIR/hooks/agy/agy-status-hook.sh"        "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+        make_symlink "$SCRIPT_DIR/hooks/agterm/agterm-agent-status.sh" "$HOME/.config/agterm/agent-status/agterm-agent-status.sh"
+        make_symlink "$SCRIPT_DIR/hooks/agterm/agterm-codex-status.sh" "$HOME/.config/agterm/agent-status/agterm-codex-status.sh"
+
+        log_info "Managing CLI binaries (~/.local/bin)..."
+        make_symlink "$SCRIPT_DIR/bin/mailbox-chat.py" "$HOME/.local/bin/mailbox-chat.py"
+        make_symlink "$SCRIPT_DIR/bin/codex-mailbox"   "$HOME/.local/bin/codex-mailbox"
+
+        reload_agterm
+        log_info "Uninstallation complete."
+        return 0
+    fi
+
     # 1. Binaries
     log_info "Managing CLI binaries (~/.local/bin)..."
     make_symlink "$SCRIPT_DIR/bin/mailbox-chat.py" "$HOME/.local/bin/mailbox-chat.py"
@@ -439,7 +550,7 @@ main() {
     # 3. Skills
     log_info "Managing agent skills..."
     make_symlink "$SCRIPT_DIR/skills/agy/mailbox-chat"   "$HOME/.gemini/config/skills/mailbox-chat"
-    if [[ -d "$HOME/.codex" ]] || (( ! UNINSTALL )); then
+    if [[ -d "$HOME/.codex" ]]; then
         make_symlink "$SCRIPT_DIR/skills/codex/mailbox-chat" "$HOME/.codex/skills/mailbox-chat"
     fi
 
@@ -452,9 +563,7 @@ main() {
     # 5. Reload
     reload_agterm
 
-    if (( UNINSTALL )); then
-        log_info "Uninstallation complete."
-    elif (( DRY_RUN )); then
+    if (( DRY_RUN )); then
         log_info "Dry run complete. No files were modified."
     else
         log_info "Installation complete! All tools and hooks are active."
