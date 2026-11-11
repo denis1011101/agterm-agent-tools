@@ -202,14 +202,18 @@ manage_agy_hooks_json() {
 import json, sys, os, copy
 
 target_path = sys.argv[1]
-manifest_file = sys.argv[2]
+fragment_path = sys.argv[2]
+manifest_file = sys.argv[3]
 
 if not os.path.exists(manifest_file):
     sys.exit(0)
 
 try:
     with open(manifest_file, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
+        content = f.read()
+    if not content.strip():
+        raise ValueError("Manifest is empty")
+    manifest = json.loads(content)
 except Exception as e:
     sys.exit(f"Error: Manifest {manifest_file} is corrupted ({e}). Aborting uninstall to protect configurations.")
 
@@ -232,17 +236,36 @@ except Exception as e:
 if not isinstance(data, dict):
     sys.exit(f"Error: Target {target_path} root is not a JSON object. Aborting uninstall.")
 
-def is_our_hook(item):
-    if not isinstance(item, dict):
+try:
+    with open(fragment_path, "r", encoding="utf-8") as f:
+        frag = json.load(f)
+except Exception:
+    frag = {}
+
+def extract_commands(obj):
+    cmds = set()
+    if isinstance(obj, dict):
+        if "command" in obj and isinstance(obj["command"], str):
+            cmds.add(obj["command"])
+        for v in obj.values():
+            cmds.update(extract_commands(v))
+    elif isinstance(obj, list):
+        for x in obj:
+            cmds.update(extract_commands(x))
+    return cmds
+
+managed_cmds = set(manifest.get("managed_commands", []))
+managed_cmds.update(extract_commands(frag))
+
+def is_our_command(cmd):
+    if not isinstance(cmd, str):
         return False
-    cmd = item.get("command", "")
-    if "agy-status-hook.sh" in cmd or "mailbox-chat.py" in cmd:
+    if cmd in managed_cmds:
         return True
-    nested = item.get("hooks")
-    if isinstance(nested, list):
-        for sub in nested:
-            if isinstance(sub, dict) and ("agy-status-hook.sh" in sub.get("command", "") or "mailbox-chat.py" in sub.get("command", "")):
-                return True
+    if "agy-status-hook.sh" in cmd and any(action in cmd for action in ["invocation", "ask", "tool-done", "stop"]):
+        return True
+    if "mailbox-chat.py" in cmd and "agy-hook" in cmd:
+        return True
     return False
 
 changed = False
@@ -256,18 +279,50 @@ for key in ["agterm-status", "mailbox-chat"]:
             was_created = manifest.get("created_" + clean_key, False)
             for event_name in list(group.keys()):
                 if isinstance(group[event_name], list):
-                    filtered = [h for h in group[event_name] if not is_our_hook(h)]
-                    if len(filtered) != len(group[event_name]):
-                        changed = True
-                    if filtered:
-                        group[event_name] = filtered
+                    orig_event_list = orig_group.get(event_name, []) if isinstance(orig_group, dict) else []
+                    new_event_list = []
+                    for item in group[event_name]:
+                        if item in orig_event_list:
+                            new_event_list.append(item)
+                            continue
+                        if isinstance(item, dict):
+                            if "command" in item and is_our_command(item["command"]):
+                                changed = True
+                                continue
+                            if "hooks" in item and isinstance(item["hooks"], list):
+                                orig_nested = []
+                                for orig_m in orig_event_list:
+                                    if isinstance(orig_m, dict) and orig_m.get("matcher") == item.get("matcher"):
+                                        orig_nested = orig_m.get("hooks", [])
+                                        break
+                                filtered_sub = []
+                                for sub in item["hooks"]:
+                                    if sub in orig_nested:
+                                        filtered_sub.append(sub)
+                                    elif isinstance(sub, dict) and is_our_command(sub.get("command", "")):
+                                        changed = True
+                                    else:
+                                        filtered_sub.append(sub)
+                                if filtered_sub:
+                                    item_copy = copy.deepcopy(item)
+                                    item_copy["hooks"] = filtered_sub
+                                    new_event_list.append(item_copy)
+                                else:
+                                    changed = True
+                                continue
+                        new_event_list.append(item)
+
+                    if new_event_list:
+                        if new_event_list != group[event_name]:
+                            group[event_name] = new_event_list
+                            changed = True
                     else:
                         if isinstance(orig_group, dict) and event_name in orig_group:
                             group[event_name] = []
                         else:
                             del group[event_name]
-                            changed = True
-            # If nothing remains and group was created by our installer, remove the group
+                        changed = True
+
             if was_created and not group:
                 del data[key]
                 changed = True
@@ -286,7 +341,7 @@ try:
     os.remove(manifest_file)
 except OSError:
     pass
-' "$target_json" "$manifest_file"
+' "$target_json" "$fragment_file" "$manifest_file"
             fi
         fi
         return 0
@@ -310,6 +365,20 @@ target_path = sys.argv[1]
 fragment_path = sys.argv[2]
 manifest_file = sys.argv[3]
 
+# 1. Validate existing manifest if present BEFORE any operations
+existing_manifest = {}
+if os.path.exists(manifest_file):
+    try:
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        if not content.strip():
+            raise ValueError("Manifest is empty")
+        existing_manifest = json.loads(content)
+        if not isinstance(existing_manifest, dict):
+            raise ValueError("Manifest root must be a JSON object")
+    except Exception as e:
+        sys.exit(f"Error: Manifest {manifest_file} is corrupted ({e}). Aborting install to preserve recovery evidence.")
+
 try:
     with open(fragment_path, "r", encoding="utf-8") as f:
         frag = json.load(f)
@@ -328,18 +397,19 @@ if os.path.exists(target_path):
         except Exception as e:
             sys.exit(f"Error: {target_path} contains malformed or unreadable JSON ({e}). Aborting install to prevent data loss.")
 
-def is_our_hook(item):
-    if not isinstance(item, dict):
-        return False
-    cmd = item.get("command", "")
-    if "agy-status-hook.sh" in cmd or "mailbox-chat.py" in cmd:
-        return True
-    nested = item.get("hooks")
-    if isinstance(nested, list):
-        for sub in nested:
-            if isinstance(sub, dict) and ("agy-status-hook.sh" in sub.get("command", "") or "mailbox-chat.py" in sub.get("command", "")):
-                return True
-    return False
+def extract_commands(obj):
+    cmds = set()
+    if isinstance(obj, dict):
+        if "command" in obj and isinstance(obj["command"], str):
+            cmds.add(obj["command"])
+        for v in obj.values():
+            cmds.update(extract_commands(v))
+    elif isinstance(obj, list):
+        for x in obj:
+            cmds.update(extract_commands(x))
+    return cmds
+
+frag_cmds = extract_commands(frag)
 
 def group_has_our_hooks(group, frag_group):
     if not isinstance(group, dict):
@@ -360,15 +430,6 @@ already_up_to_date = (
 if already_up_to_date and os.path.exists(manifest_file):
     sys.exit(0)
 
-# Load existing manifest if present to preserve initial pre-install values on reinstall
-existing_manifest = {}
-if os.path.exists(manifest_file):
-    try:
-        with open(manifest_file, "r", encoding="utf-8") as f:
-            existing_manifest = json.load(f)
-    except Exception:
-        existing_manifest = {}
-
 # Create unique exclusive backup before mutating existing configuration
 if file_existed and data:
     backup_path = f"{target_path}.bak.{int(time.time())}_{uuid.uuid4().hex[:8]}"
@@ -377,7 +438,7 @@ if file_existed and data:
     except Exception as e:
         sys.exit(f"Error: Failed to create backup at {backup_path}: {e}. Aborting install.")
 
-# Record manifest with original pre-install values
+# Record manifest with original pre-install values and managed commands
 os.makedirs(os.path.dirname(manifest_file), exist_ok=True)
 manifest = {
     "file_existed": existing_manifest.get("file_existed", file_existed),
@@ -385,6 +446,7 @@ manifest = {
     "original_mailbox_chat": existing_manifest.get("original_mailbox_chat", copy.deepcopy(data.get("mailbox-chat"))),
     "created_agterm_status": existing_manifest.get("created_agterm_status", "agterm-status" not in data),
     "created_mailbox_chat": existing_manifest.get("created_mailbox_chat", "mailbox-chat" not in data),
+    "managed_commands": sorted(list(frag_cmds.union(existing_manifest.get("managed_commands", [])))),
     "installed_at": existing_manifest.get("installed_at", int(time.time())),
     "updated_at": int(time.time())
 }
@@ -394,7 +456,21 @@ with open(tmp_manifest, "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2)
 os.replace(tmp_manifest, manifest_file)
 
-# Surgical merge: preserve custom keys inside each group, append our hooks to list
+managed_cmds = set(manifest["managed_commands"])
+
+def is_our_command(cmd):
+    if not isinstance(cmd, str):
+        return False
+    if cmd in managed_cmds:
+        return True
+    if "agy-status-hook.sh" in cmd and any(action in cmd for action in ["invocation", "ask", "tool-done", "stop"]):
+        return True
+    if "mailbox-chat.py" in cmd and "agy-hook" in cmd:
+        return True
+    return False
+
+# Surgical merge and upgrade reconciliation:
+# For each event, if an existing hook runs an older variant of our hook, upgrade it in place
 for key, frag_group in frag.items():
     if key not in data or not isinstance(data[key], dict):
         data[key] = copy.deepcopy(frag_group)
@@ -404,8 +480,39 @@ for key, frag_group in frag.items():
                 data[key][event_name] = copy.deepcopy(hook_list)
             else:
                 for h in hook_list:
-                    if h not in data[key][event_name]:
-                        data[key][event_name].append(copy.deepcopy(h))
+                    # Check if matching hook is already in data[key][event_name]
+                    if h in data[key][event_name]:
+                        continue
+                    # If this is a direct command hook (like Stop or PreInvocation), check for older variant
+                    if "command" in h:
+                        replaced = False
+                        for idx, existing_h in enumerate(data[key][event_name]):
+                            if isinstance(existing_h, dict) and is_our_command(existing_h.get("command", "")):
+                                data[key][event_name][idx] = copy.deepcopy(h)
+                                replaced = True
+                                break
+                        if not replaced:
+                            data[key][event_name].append(copy.deepcopy(h))
+                    elif "matcher" in h and "hooks" in h:
+                        # Matcher with sub-hooks (like PreToolUse)
+                        replaced = False
+                        for existing_m in data[key][event_name]:
+                            if isinstance(existing_m, dict) and existing_m.get("matcher") == h.get("matcher"):
+                                existing_subs = existing_m.setdefault("hooks", [])
+                                for sub_h in h["hooks"]:
+                                    if sub_h not in existing_subs:
+                                        sub_replaced = False
+                                        for s_idx, s_h in enumerate(existing_subs):
+                                            if isinstance(s_h, dict) and is_our_command(s_h.get("command", "")):
+                                                existing_subs[s_idx] = copy.deepcopy(sub_h)
+                                                sub_replaced = True
+                                                break
+                                        if not sub_replaced:
+                                            existing_subs.append(copy.deepcopy(sub_h))
+                                replaced = True
+                                break
+                        if not replaced:
+                            data[key][event_name].append(copy.deepcopy(h))
 
 tmp_target = f"{target_path}.tmp.{uuid.uuid4().hex}"
 with open(tmp_target, "w", encoding="utf-8") as f:

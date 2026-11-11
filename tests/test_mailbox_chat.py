@@ -370,8 +370,9 @@ class WaiterTest(StateTest):
         w = self.waiter()
         with mock.patch("sys.stderr", io.StringIO()):
             self.assertEqual(w.run("Stop", ""), mc.WAKE)
-        self.assertTrue(w.listening())
-        self.assertEqual(mc.receiver(SID, LEFT), "claude")
+        with mock.patch.object(mc, "pid_alive", return_value=True):
+            self.assertTrue(w.listening())
+            self.assertEqual(mc.receiver(SID, LEFT), "claude")
 
     def test_listening_ends_with_the_recorded_claude(self):
         w = self.waiter()

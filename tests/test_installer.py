@@ -266,6 +266,64 @@ class TestInstaller(unittest.TestCase):
         self.assertEqual(agy_json.read_text(), before_content)
         self.assertTrue(manifest_file.exists())
 
+    def test_nested_custom_command_in_matcher_preserved_on_uninstall(self):
+        home = self.root / "home_nested_custom"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": "echo KEEP_ME"})
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        self.assertIn("KEEP_ME", agy_json.read_text())
+
+    def test_foreign_basename_hook_restored_identically_on_uninstall(self):
+        home = self.root / "home_foreign_basename"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        original = {"mailbox-chat": {"PreInvocation": [{"type": "command", "command": "/custom/mailbox-chat.py custom-mode"}]}}
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(json.loads(agy_json.read_text()), original)
+
+    def test_corrupt_manifest_on_reinstall_aborts_and_preserves_manifest(self):
+        home = self.root / "home_corrupt_reinstall"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        original = {"mailbox-chat": {"custom": "ORIGINAL"}, "agterm-status": {"custom": "ORIGINAL"}}
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        manifest_file = home / ".local/state/agterm-agent-tools/manifest.json"
+        manifest_file.write_text("{broken")
+
+        data = json.loads(agy_json.read_text())
+        del data["agterm-status"]["Stop"]
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, expect_fail=True)
+        self.assertEqual(manifest_file.read_text(), "{broken")
+
+    def test_upgrade_reconciles_managed_hook_in_place_without_duplicates(self):
+        home = self.root / "home_upgrade_reconcile"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["Stop"][0]["command"] = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" old-stop"
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home)
+        stop_hooks = json.loads(agy_json.read_text())["agterm-status"]["Stop"]
+        expected_stop = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" stop"
+        self.assertEqual(len(stop_hooks), 1)
+        self.assertEqual(stop_hooks[0]["command"], expected_stop)
+
 
 if __name__ == "__main__":
     unittest.main()

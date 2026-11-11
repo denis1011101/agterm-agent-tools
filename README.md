@@ -150,7 +150,7 @@ mailbox-chat.py agy-wait
 All components include automated test coverage:
 
 ```bash
-# 1. Run Python unit tests (63 tests: protocol, linux transport, installer)
+# 1. Run Python unit tests (67 tests: protocol, linux transport, installer)
 python3 -m unittest discover -s tests -p "test_*.py"
 
 # 2. Run Desktop notification test suite (against production agy-status-hook.sh)
