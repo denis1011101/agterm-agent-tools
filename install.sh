@@ -277,70 +277,126 @@ except Exception as e:
 if not isinstance(data, dict):
     sys.exit(f"Error: Target {target_path} root is not a JSON object. Aborting uninstall.")
 
-def is_our_command_str(cmd_str):
+MANAGED_BIN_RELPATHS = {
+    ".config/agterm/hooks/agy/agy-status-hook.sh": "agy-status-hook.sh",
+    ".local/bin/mailbox-chat.py": "mailbox-chat.py",
+}
+
+MANAGED_ACTIONS = {
+    "agy-status-hook.sh": {"invocation", "ask", "tool-done", "stop"},
+    "mailbox-chat.py": {"agy-hook"},
+}
+
+LEGACY_ACTIONS = {
+    "agy-status-hook.sh": {
+        "old-stop": "stop",
+    },
+    "mailbox-chat.py": {},
+}
+
+def get_managed_hook_info(cmd_str):
     if not isinstance(cmd_str, str):
-        return False
-    exact_targets = {
-        "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\"",
-        f"\"{home}/.config/agterm/hooks/agy/agy-status-hook.sh\"",
-        "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh",
-        f"{home}/.config/agterm/hooks/agy/agy-status-hook.sh",
-        "\"$HOME/.local/bin/mailbox-chat.py\"",
-        f"\"{home}/.local/bin/mailbox-chat.py\"",
-        "$HOME/.local/bin/mailbox-chat.py",
-        f"{home}/.local/bin/mailbox-chat.py",
-    }
+        return None
     words = cmd_str.strip().split()
     if not words:
-        return False
-    return words[0] in exact_targets
+        return None
+    raw_bin = words[0].strip("\"'\''")
+    if home:
+        if raw_bin.startswith(home):
+            raw_bin = "$HOME" + raw_bin[len(home):]
+        elif raw_bin.startswith("${HOME}"):
+            raw_bin = "$HOME" + raw_bin[len("${HOME}"):]
+
+    bin_name = None
+    if raw_bin.startswith("$HOME/"):
+        rel = raw_bin[len("$HOME/"):]
+        if rel in MANAGED_BIN_RELPATHS:
+            bin_name = MANAGED_BIN_RELPATHS[rel]
+    if not bin_name:
+        return None
+
+    action = words[1].strip("\"'\''") if len(words) > 1 else ""
+    if action in MANAGED_ACTIONS.get(bin_name, set()):
+        return {
+            "binary": bin_name,
+            "action": action,
+            "canonical": action,
+            "is_legacy": False
+        }
+    if action in LEGACY_ACTIONS.get(bin_name, {}):
+        return {
+            "binary": bin_name,
+            "action": action,
+            "canonical": LEGACY_ACTIONS[bin_name][action],
+            "is_legacy": True
+        }
+    return None
 
 def uninstall_event_list(curr_list, orig_list):
     orig_list = orig_list if isinstance(orig_list, list) else []
-    res = []
-    
-    # 1. Any original items: restore original definitions
-    for orig_item in orig_list:
-        res.append(copy.deepcopy(orig_item))
+    orig_managed = {}
+    for om in orig_list:
+        if isinstance(om, dict) and "command" in om:
+            info = get_managed_hook_info(om["command"])
+            if info:
+                orig_managed[(info["binary"], info["canonical"])] = om
 
-    # 2. Check current items for user-added hooks or matchers with custom commands
+    res = []
     for curr_item in curr_list:
-        if isinstance(curr_item, dict):
-            if "command" in curr_item:
-                if is_our_command_str(curr_item["command"]):
-                    # Managed hook: handled (restored from orig if in orig, or dropped)
-                    continue
+        if not isinstance(curr_item, dict):
+            res.append(copy.deepcopy(curr_item))
+            continue
+
+        if "command" in curr_item:
+            info = get_managed_hook_info(curr_item["command"])
+            if not info:
+                # Custom user command or foreign tool: keep current definition untouched
+                res.append(copy.deepcopy(curr_item))
+            else:
+                key = (info["binary"], info["canonical"])
+                if key in orig_managed:
+                    # Pre-existing hook before install: restore original definition
+                    res.append(copy.deepcopy(orig_managed[key]))
                 else:
-                    if curr_item not in res:
-                        res.append(copy.deepcopy(curr_item))
-            elif "hooks" in curr_item and isinstance(curr_item["hooks"], list):
-                orig_matcher_subs = []
-                for om in orig_list:
-                    if isinstance(om, dict) and om.get("matcher") == curr_item.get("matcher"):
-                        orig_matcher_subs = om.get("hooks", [])
-                        break
-                filtered_subs = []
-                for os_sub in orig_matcher_subs:
-                    filtered_subs.append(copy.deepcopy(os_sub))
-                for cs_sub in curr_item["hooks"]:
-                    if isinstance(cs_sub, dict):
-                        if is_our_command_str(cs_sub.get("command", "")):
-                            continue
-                        else:
-                            if cs_sub not in filtered_subs:
-                                filtered_subs.append(copy.deepcopy(cs_sub))
-                if filtered_subs:
-                    # Check if matching matcher already in res
-                    found = False
-                    for r_item in res:
-                        if isinstance(r_item, dict) and r_item.get("matcher") == curr_item.get("matcher"):
-                            r_item["hooks"] = filtered_subs
-                            found = True
-                            break
-                    if not found:
-                        m_copy = copy.deepcopy(curr_item)
-                        m_copy["hooks"] = filtered_subs
-                        res.append(m_copy)
+                    # Added by our installer: drop it
+                    continue
+        elif "matcher" in curr_item and isinstance(curr_item.get("hooks"), list):
+            orig_matcher = None
+            for om in orig_list:
+                if isinstance(om, dict) and om.get("matcher") == curr_item.get("matcher"):
+                    orig_matcher = om
+                    break
+
+            orig_sub_managed = {}
+            if orig_matcher and isinstance(orig_matcher.get("hooks"), list):
+                for om_sub in orig_matcher["hooks"]:
+                    if isinstance(om_sub, dict) and "command" in om_sub:
+                        s_info = get_managed_hook_info(om_sub["command"])
+                        if s_info:
+                            orig_sub_managed[(s_info["binary"], s_info["canonical"])] = om_sub
+
+            filtered_subs = []
+            for cs_sub in curr_item["hooks"]:
+                if not isinstance(cs_sub, dict) or "command" not in cs_sub:
+                    filtered_subs.append(copy.deepcopy(cs_sub))
+                    continue
+                cs_info = get_managed_hook_info(cs_sub["command"])
+                if not cs_info:
+                    filtered_subs.append(copy.deepcopy(cs_sub))
+                else:
+                    s_key = (cs_info["binary"], cs_info["canonical"])
+                    if s_key in orig_sub_managed:
+                        filtered_subs.append(copy.deepcopy(orig_sub_managed[s_key]))
+                    else:
+                        continue
+
+            if filtered_subs:
+                m_copy = copy.deepcopy(curr_item)
+                m_copy["hooks"] = filtered_subs
+                res.append(m_copy)
+        else:
+            res.append(copy.deepcopy(curr_item))
+
     return res
 
 changed = False
@@ -362,25 +418,30 @@ for key in ["agterm-status", "mailbox-chat"]:
                             group[event_name] = new_event_list
                             changed = True
                     else:
-                        if isinstance(orig_group, dict) and event_name in orig_group:
-                            group[event_name] = []
+                        if isinstance(orig_group, dict) and event_name in orig_group and orig_group[event_name] == []:
+                            if group[event_name] != []:
+                                group[event_name] = []
+                                changed = True
                         else:
                             del group[event_name]
-                        changed = True
+                            changed = True
 
             if was_created and not group:
                 del data[key]
                 changed = True
-            elif orig_group is not None and not group:
-                data[key] = copy.deepcopy(orig_group)
-                changed = True
 
 if changed:
-    tmp_target = f"{target_path}.tmp.{os.getpid()}"
-    with open(tmp_target, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp_target, target_path)
+    if not manifest.get("file_existed", True) and not data:
+        try:
+            os.remove(target_path)
+        except OSError:
+            pass
+    else:
+        tmp_target = f"{target_path}.tmp.{os.getpid()}"
+        with open(tmp_target, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_target, target_path)
 
 try:
     os.remove(manifest_file)
@@ -442,27 +503,60 @@ if os.path.exists(target_path):
         except Exception as e:
             sys.exit(f"Error: {target_path} contains malformed or unreadable JSON ({e}). Aborting install to prevent data loss.")
 
-def is_our_command_str(cmd_str):
+MANAGED_BIN_RELPATHS = {
+    ".config/agterm/hooks/agy/agy-status-hook.sh": "agy-status-hook.sh",
+    ".local/bin/mailbox-chat.py": "mailbox-chat.py",
+}
+
+MANAGED_ACTIONS = {
+    "agy-status-hook.sh": {"invocation", "ask", "tool-done", "stop"},
+    "mailbox-chat.py": {"agy-hook"},
+}
+
+LEGACY_ACTIONS = {
+    "agy-status-hook.sh": {
+        "old-stop": "stop",
+    },
+    "mailbox-chat.py": {},
+}
+
+def get_managed_hook_info(cmd_str):
     if not isinstance(cmd_str, str):
-        return False
-    exact_targets = {
-        "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\"",
-        f"\"{home}/.config/agterm/hooks/agy/agy-status-hook.sh\"",
-        "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh",
-        f"{home}/.config/agterm/hooks/agy/agy-status-hook.sh",
-        "\"$HOME/.local/bin/mailbox-chat.py\"",
-        f"\"{home}/.local/bin/mailbox-chat.py\"",
-        "$HOME/.local/bin/mailbox-chat.py",
-        f"{home}/.local/bin/mailbox-chat.py",
-    }
+        return None
     words = cmd_str.strip().split()
     if not words:
-        return False
-    return words[0] in exact_targets
+        return None
+    raw_bin = words[0].strip("\"'\''")
+    if home:
+        if raw_bin.startswith(home):
+            raw_bin = "$HOME" + raw_bin[len(home):]
+        elif raw_bin.startswith("${HOME}"):
+            raw_bin = "$HOME" + raw_bin[len("${HOME}"):]
 
-def get_command_action(cmd_str):
-    words = cmd_str.strip().split()
-    return words[1] if len(words) > 1 else ""
+    bin_name = None
+    if raw_bin.startswith("$HOME/"):
+        rel = raw_bin[len("$HOME/"):]
+        if rel in MANAGED_BIN_RELPATHS:
+            bin_name = MANAGED_BIN_RELPATHS[rel]
+    if not bin_name:
+        return None
+
+    action = words[1].strip("\"'\''") if len(words) > 1 else ""
+    if action in MANAGED_ACTIONS.get(bin_name, set()):
+        return {
+            "binary": bin_name,
+            "action": action,
+            "canonical": action,
+            "is_legacy": False
+        }
+    if action in LEGACY_ACTIONS.get(bin_name, {}):
+        return {
+            "binary": bin_name,
+            "action": action,
+            "canonical": LEGACY_ACTIONS[bin_name][action],
+            "is_legacy": True
+        }
+    return None
 
 def group_has_our_hooks(group, frag_group):
     if not isinstance(group, dict):
@@ -472,9 +566,13 @@ def group_has_our_hooks(group, frag_group):
             return False
         for expected in hook_list:
             if "command" in expected:
-                exp_action = get_command_action(expected["command"])
+                exp_info = get_managed_hook_info(expected["command"])
+                if not exp_info:
+                    continue
                 found = any(
-                    isinstance(h, dict) and is_our_command_str(h.get("command", "")) and get_command_action(h.get("command", "")) == exp_action
+                    isinstance(h, dict) and
+                    (get_managed_hook_info(h.get("command", "")) or {}).get("canonical") == exp_info["canonical"] and
+                    not (get_managed_hook_info(h.get("command", "")) or {}).get("is_legacy")
                     for h in group[event_name]
                 )
                 if not found:
@@ -484,9 +582,13 @@ def group_has_our_hooks(group, frag_group):
                 for m in group[event_name]:
                     if isinstance(m, dict) and m.get("matcher") == expected.get("matcher"):
                         for exp_sub in expected["hooks"]:
-                            sub_action = get_command_action(exp_sub.get("command", ""))
+                            sub_info = get_managed_hook_info(exp_sub.get("command", ""))
+                            if not sub_info:
+                                continue
                             if not any(
-                                isinstance(sh, dict) and is_our_command_str(sh.get("command", "")) and get_command_action(sh.get("command", "")) == sub_action
+                                isinstance(sh, dict) and
+                                (get_managed_hook_info(sh.get("command", "")) or {}).get("canonical") == sub_info["canonical"] and
+                                not (get_managed_hook_info(sh.get("command", "")) or {}).get("is_legacy")
                                 for sh in m.get("hooks", [])
                             ):
                                 return False
@@ -540,21 +642,20 @@ for key, frag_group in frag.items():
             else:
                 for h in hook_list:
                     if "command" in h:
-                        h_action = get_command_action(h["command"])
+                        h_info = get_managed_hook_info(h["command"])
                         replaced = False
                         for idx, existing_h in enumerate(data[key][event_name]):
-                            if isinstance(existing_h, dict) and is_our_command_str(existing_h.get("command", "")):
-                                ex_action = get_command_action(existing_h.get("command", ""))
-                                if ex_action == h_action:
-                                    # Existing hook is ALREADY running our command for this action (e.g. custom timeout)
-                                    # Preserve user custom settings!
-                                    replaced = True
-                                    break
-                                else:
-                                    # Outdated action: upgrade in place
-                                    data[key][event_name][idx] = copy.deepcopy(h)
-                                    replaced = True
-                                    break
+                            if isinstance(existing_h, dict) and "command" in existing_h:
+                                ex_info = get_managed_hook_info(existing_h["command"])
+                                if ex_info and h_info and ex_info["binary"] == h_info["binary"] and ex_info["canonical"] == h_info["canonical"]:
+                                    if ex_info["is_legacy"]:
+                                        data[key][event_name][idx]["command"] = h["command"]
+                                        replaced = True
+                                        break
+                                    else:
+                                        # Current action already running (preserve user settings/timeout)
+                                        replaced = True
+                                        break
                         if not replaced:
                             data[key][event_name].append(copy.deepcopy(h))
                     elif "matcher" in h and "hooks" in h:
@@ -563,18 +664,19 @@ for key, frag_group in frag.items():
                             if isinstance(existing_m, dict) and existing_m.get("matcher") == h.get("matcher"):
                                 existing_subs = existing_m.setdefault("hooks", [])
                                 for sub_h in h["hooks"]:
-                                    sub_action = get_command_action(sub_h.get("command", ""))
+                                    sub_info = get_managed_hook_info(sub_h.get("command", ""))
                                     sub_replaced = False
                                     for s_idx, s_h in enumerate(existing_subs):
-                                        if isinstance(s_h, dict) and is_our_command_str(s_h.get("command", "")):
-                                            ex_sub_action = get_command_action(s_h.get("command", ""))
-                                            if ex_sub_action == sub_action:
-                                                sub_replaced = True
-                                                break
-                                            else:
-                                                existing_subs[s_idx] = copy.deepcopy(sub_h)
-                                                sub_replaced = True
-                                                break
+                                        if isinstance(s_h, dict) and "command" in s_h:
+                                            ex_sub_info = get_managed_hook_info(s_h["command"])
+                                            if ex_sub_info and sub_info and ex_sub_info["binary"] == sub_info["binary"] and ex_sub_info["canonical"] == sub_info["canonical"]:
+                                                if ex_sub_info["is_legacy"]:
+                                                    existing_subs[s_idx]["command"] = sub_h["command"]
+                                                    sub_replaced = True
+                                                    break
+                                                else:
+                                                    sub_replaced = True
+                                                    break
                                     if not sub_replaced:
                                         existing_subs.append(copy.deepcopy(sub_h))
                                 replaced = True

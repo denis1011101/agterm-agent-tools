@@ -373,6 +373,66 @@ class TestInstaller(unittest.TestCase):
         self.assertFalse(bin_target.exists())
         self.assertFalse((home / ".local/state/agterm-agent-tools/manifest.json").exists())
 
+    def test_user_edited_command_preserved_on_uninstall_without_stale_command(self):
+        home = self.root / "home_edit_original"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        original = {"mailbox-chat": {"PreInvocation": [{"type": "command", "command": "echo ORIGINAL"}]}}
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["mailbox-chat"]["PreInvocation"][0]["command"] = "echo UPDATED"
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        expected = {"mailbox-chat": {"PreInvocation": [{"type": "command", "command": "echo UPDATED"}]}}
+        self.assertEqual(json.loads(agy_json.read_text()), expected)
+
+    def test_user_deleted_command_stays_deleted_on_uninstall(self):
+        home = self.root / "home_delete_original"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        original = {"mailbox-chat": {"PreInvocation": [{"type": "command", "command": "echo ORIGINAL"}]}}
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        del data["mailbox-chat"]["PreInvocation"][0]
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        self.assertNotIn("ORIGINAL", agy_json.read_text())
+
+    def test_custom_action_on_managed_binary_preserved_on_uninstall(self):
+        home = self.root / "home_custom_action_after"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        custom = {"type": "command", "command": "\"$HOME/.local/bin/mailbox-chat.py\" status"}
+        data["mailbox-chat"]["PreInvocation"].append(custom)
+        agy_json.write_text(json.dumps(data))
+
+        self.run_installer(home, args=["--uninstall"])
+        self.assertIn(" status", agy_json.read_text())
+        self.assertNotIn("agy-hook", agy_json.read_text())
+
+    def test_custom_action_on_managed_binary_preserved_during_install(self):
+        home = self.root / "home_custom_action_before"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        custom = {"type": "command", "command": "\"$HOME/.local/bin/mailbox-chat.py\" status"}
+        original = {"mailbox-chat": {"PreInvocation": [custom]}}
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        installed = json.loads(agy_json.read_text())["mailbox-chat"]["PreInvocation"]
+        self.assertIn(custom, installed)
+        managed = {"type": "command", "command": "\"$HOME/.local/bin/mailbox-chat.py\" agy-hook", "timeout": 5}
+        self.assertIn(managed, installed)
+
 
 if __name__ == "__main__":
     unittest.main()
