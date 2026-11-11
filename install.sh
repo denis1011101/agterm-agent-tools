@@ -332,72 +332,77 @@ def get_managed_hook_info(cmd_str):
         }
     return None
 
-def uninstall_event_list(curr_list, orig_list):
+def reconcile_hook_list(curr_list, orig_list):
+    curr_list = curr_list if isinstance(curr_list, list) else []
     orig_list = orig_list if isinstance(orig_list, list) else []
-    orig_managed = {}
-    for om in orig_list:
-        if isinstance(om, dict) and "command" in om:
-            info = get_managed_hook_info(om["command"])
-            if info:
-                orig_managed[(info["binary"], info["canonical"])] = om
-
+    orig_consumed = [False] * len(orig_list)
     res = []
+
     for curr_item in curr_list:
         if not isinstance(curr_item, dict):
             res.append(copy.deepcopy(curr_item))
             continue
 
+        # 1. Exact match check
+        exact_idx = -1
+        for i, om in enumerate(orig_list):
+            if not orig_consumed[i] and om == curr_item:
+                exact_idx = i
+                break
+        if exact_idx != -1:
+            orig_consumed[exact_idx] = True
+            res.append(copy.deepcopy(curr_item))
+            continue
+
+        # 2. Matcher handling
+        if "matcher" in curr_item and isinstance(curr_item.get("hooks"), list):
+            m_idx = -1
+            for i, om in enumerate(orig_list):
+                if not orig_consumed[i] and isinstance(om, dict) and om.get("matcher") == curr_item.get("matcher"):
+                    m_idx = i
+                    break
+            orig_subs = []
+            if m_idx != -1:
+                orig_consumed[m_idx] = True
+                orig_subs = orig_list[m_idx].get("hooks", []) if isinstance(orig_list[m_idx].get("hooks"), list) else []
+
+            filtered_subs = reconcile_hook_list(curr_item["hooks"], orig_subs)
+            if filtered_subs:
+                m_copy = copy.deepcopy(curr_item)
+                m_copy["hooks"] = filtered_subs
+                res.append(m_copy)
+            continue
+
+        # 3. Direct command hook handling
         if "command" in curr_item:
             info = get_managed_hook_info(curr_item["command"])
             if not info:
                 # Custom user command or foreign tool: keep current definition untouched
                 res.append(copy.deepcopy(curr_item))
             else:
-                key = (info["binary"], info["canonical"])
-                if key in orig_managed:
-                    # Pre-existing hook before install: restore original definition
-                    res.append(copy.deepcopy(orig_managed[key]))
+                legacy_idx = -1
+                for i, om in enumerate(orig_list):
+                    if not orig_consumed[i] and isinstance(om, dict) and "command" in om:
+                        om_info = get_managed_hook_info(om["command"])
+                        if om_info and om_info["binary"] == info["binary"] and om_info["canonical"] == info["canonical"]:
+                            legacy_idx = i
+                            break
+                if legacy_idx != -1:
+                    orig_consumed[legacy_idx] = True
+                    om_info = get_managed_hook_info(orig_list[legacy_idx]["command"])
+                    if om_info and om_info["is_legacy"]:
+                        res.append(copy.deepcopy(orig_list[legacy_idx]))
+                    else:
+                        res.append(copy.deepcopy(curr_item))
                 else:
                     # Added by our installer: drop it
-                    continue
-        elif "matcher" in curr_item and isinstance(curr_item.get("hooks"), list):
-            orig_matcher = None
-            for om in orig_list:
-                if isinstance(om, dict) and om.get("matcher") == curr_item.get("matcher"):
-                    orig_matcher = om
-                    break
-
-            orig_sub_managed = {}
-            if orig_matcher and isinstance(orig_matcher.get("hooks"), list):
-                for om_sub in orig_matcher["hooks"]:
-                    if isinstance(om_sub, dict) and "command" in om_sub:
-                        s_info = get_managed_hook_info(om_sub["command"])
-                        if s_info:
-                            orig_sub_managed[(s_info["binary"], s_info["canonical"])] = om_sub
-
-            filtered_subs = []
-            for cs_sub in curr_item["hooks"]:
-                if not isinstance(cs_sub, dict) or "command" not in cs_sub:
-                    filtered_subs.append(copy.deepcopy(cs_sub))
-                    continue
-                cs_info = get_managed_hook_info(cs_sub["command"])
-                if not cs_info:
-                    filtered_subs.append(copy.deepcopy(cs_sub))
-                else:
-                    s_key = (cs_info["binary"], cs_info["canonical"])
-                    if s_key in orig_sub_managed:
-                        filtered_subs.append(copy.deepcopy(orig_sub_managed[s_key]))
-                    else:
-                        continue
-
-            if filtered_subs:
-                m_copy = copy.deepcopy(curr_item)
-                m_copy["hooks"] = filtered_subs
-                res.append(m_copy)
+                    pass
         else:
             res.append(copy.deepcopy(curr_item))
 
     return res
+
+uninstall_event_list = reconcile_hook_list
 
 changed = False
 

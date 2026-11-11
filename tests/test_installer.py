@@ -433,6 +433,45 @@ class TestInstaller(unittest.TestCase):
         managed = {"type": "command", "command": "\"$HOME/.local/bin/mailbox-chat.py\" agy-hook", "timeout": 5}
         self.assertIn(managed, installed)
 
+    def test_multiple_direct_hooks_multiplicity_preserved_on_uninstall(self):
+        home = self.root / "home_multi_direct"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        stop_cmd = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" stop"
+        original = {
+            "agterm-status": {
+                "Stop": [
+                    {"type": "command", "command": stop_cmd, "timeout": 40},
+                    {"type": "command", "command": stop_cmd, "timeout": 60},
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(json.loads(agy_json.read_text()), original)
+
+    def test_multiple_matchers_with_same_pattern_preserved_on_uninstall(self):
+        home = self.root / "home_multi_matchers"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        pattern = "ask_question|ask_permission"
+        ask_cmd = "\"$HOME/.config/agterm/hooks/agy/agy-status-hook.sh\" ask"
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    {"matcher": pattern, "hooks": [{"type": "command", "command": ask_cmd, "timeout": 40}]},
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(json.loads(agy_json.read_text()), original)
+
 
 if __name__ == "__main__":
     unittest.main()
