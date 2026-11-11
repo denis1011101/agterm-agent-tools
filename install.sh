@@ -336,11 +336,26 @@ def score_matcher_similarity(curr_m, orig_m):
     curr_subs = curr_m.get("hooks", []) if isinstance(curr_m.get("hooks"), list) else []
     orig_subs = orig_m.get("hooks", []) if isinstance(orig_m.get("hooks"), list) else []
     score = 0
+    if curr_m == orig_m:
+        score += 5000
+
+    curr_has_custom = any(isinstance(cs, dict) and "command" in cs and not get_managed_hook_info(cs["command"]) for cs in curr_subs)
+    orig_has_custom = any(isinstance(os_item, dict) and "command" in os_item and not get_managed_hook_info(os_item["command"]) for os_item in orig_subs)
+    if curr_has_custom == orig_has_custom:
+        score += 150
+
     for cs in curr_subs:
+        if not isinstance(cs, dict):
+            if cs in orig_subs:
+                score += 100
+            continue
+        cs_info = get_managed_hook_info(cs.get("command", ""))
         if cs in orig_subs:
-            score += 100
-        elif isinstance(cs, dict) and "command" in cs:
-            cs_info = get_managed_hook_info(cs["command"])
+            if not cs_info:
+                score += 1000
+            else:
+                score += 200
+        elif "command" in cs:
             for os_item in orig_subs:
                 if isinstance(os_item, dict) and "command" in os_item:
                     os_info = get_managed_hook_info(os_item["command"])
@@ -349,7 +364,7 @@ def score_matcher_similarity(curr_m, orig_m):
                             score += 50
                     elif not cs_info and not os_info:
                         if cs["command"] == os_item["command"]:
-                            score += 80
+                            score += 800
     return score
 
 def reconcile_hook_list(curr_list, orig_list):
@@ -482,7 +497,8 @@ def derive_mutations(manifest, frag, home):
                                 for sh in first_m.get("hooks", [])
                             )
                             if not first_has:
-                                mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h)})
+                                first_subs = first_m.get("hooks", []) if isinstance(first_m.get("hooks"), list) else []
+                                mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h), "target_hooks": copy.deepcopy(first_subs)})
     return mutations
 
 def rollback_mutations(data, manifest):
@@ -551,35 +567,105 @@ def rollback_mutations(data, manifest):
                 continue
 
             orig_group = orig_status if key == "agterm-status" else orig_chat
-            orig_matchers = orig_group.get(event, []) if isinstance(orig_group, dict) else []
+            orig_event_list = orig_group.get(event, []) if isinstance(orig_group, dict) else []
+            orig_matchers = [
+                om for om in orig_event_list
+                if isinstance(om, dict) and om.get("matcher") == pattern and isinstance(om.get("hooks"), list)
+            ]
 
-            # Identify untouched original matchers to protect them from rollback
-            unconsumed_orig = list(orig_matchers)
-            protected_indices = set()
-            for c_idx, curr_m in enumerate(data[key][event]):
-                if curr_m in unconsumed_orig:
-                    protected_indices.add(c_idx)
-                    unconsumed_orig.remove(curr_m)
+            curr_matchers = [
+                (c_idx, cm) for c_idx, cm in enumerate(data[key][event])
+                if isinstance(cm, dict) and cm.get("matcher") == pattern and isinstance(cm.get("hooks"), list)
+            ]
 
-            target_m = None
-            target_s_idx = -1
-            for c_idx, curr_m in enumerate(data[key][event]):
-                if c_idx in protected_indices:
-                    continue
-                if isinstance(curr_m, dict) and curr_m.get("matcher") == pattern and isinstance(curr_m.get("hooks"), list):
-                    for s_idx, s_h in enumerate(curr_m["hooks"]):
-                        if isinstance(s_h, dict) and "command" in s_h:
-                            s_info = get_managed_hook_info(s_h["command"])
-                            if s_info and s_info["binary"] == sub_info["binary"] and s_info["canonical"] == sub_info["canonical"]:
-                                if s_h.get("timeout") == m["hook"].get("timeout"):
-                                    target_m = curr_m
-                                    target_s_idx = s_idx
-                                    break
-                    if target_s_idx != -1:
-                        break
+            target_hooks = m.get("target_hooks")
 
-            if target_m is not None and target_s_idx != -1:
-                del target_m["hooks"][target_s_idx]
+            # 1. Pair each curr_matcher with the best matching orig_matcher
+            pair_scores = []
+            for c_i, (c_idx, cm) in enumerate(curr_matchers):
+                for o_i, om in enumerate(orig_matchers):
+                    s = score_matcher_similarity(cm, om)
+                    if c_i == o_i:
+                        s += 50
+                    pair_scores.append((s, c_i, o_i))
+
+            pair_scores.sort(key=lambda x: x[0], reverse=True)
+            paired_curr_to_orig = {}
+            used_curr = set()
+            used_orig = set()
+            for s, c_i, o_i in pair_scores:
+                if c_i not in used_curr and o_i not in used_orig:
+                    paired_curr_to_orig[c_i] = o_i
+                    used_curr.add(c_i)
+                    used_orig.add(o_i)
+
+            # 2. In each paired orig_matcher, identify preserved original children matching this hook
+            protected_sub_hooks = set()  # set of (c_idx, s_idx)
+            for c_i, (c_idx, cm) in enumerate(curr_matchers):
+                if c_i in paired_curr_to_orig:
+                    o_i = paired_curr_to_orig[c_i]
+                    om = orig_matchers[o_i]
+                    orig_hooks = []
+                    for oh in om.get("hooks", []):
+                        if isinstance(oh, dict) and "command" in oh:
+                            oh_info = get_managed_hook_info(oh["command"])
+                            if oh_info and oh_info["binary"] == sub_info["binary"] and oh_info["canonical"] == sub_info["canonical"]:
+                                orig_hooks.append(oh)
+
+                    unconsumed_oh = list(orig_hooks)
+                    # Pass 1: exact matches
+                    for s_idx, sh in enumerate(cm.get("hooks", [])):
+                        if isinstance(sh, dict) and "command" in sh:
+                            sh_info = get_managed_hook_info(sh["command"])
+                            if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
+                                if sh in unconsumed_oh:
+                                    protected_sub_hooks.add((c_idx, s_idx))
+                                    unconsumed_oh.remove(sh)
+                    # Pass 2: remaining canonical matches (e.g. user edited timeout)
+                    for s_idx, sh in enumerate(cm.get("hooks", [])):
+                        if (c_idx, s_idx) not in protected_sub_hooks and isinstance(sh, dict) and "command" in sh:
+                            sh_info = get_managed_hook_info(sh["command"])
+                            if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
+                                if unconsumed_oh:
+                                    protected_sub_hooks.add((c_idx, s_idx))
+                                    unconsumed_oh.pop(0)
+
+            # 3. Find the best candidate hook to delete:
+            # Must match sub_info["canonical"] and m["hook"]["timeout"], and not be in protected_sub_hooks.
+            best_target_m = None
+            best_target_s_idx = -1
+            best_candidate_score = -1
+
+            for c_i, (c_idx, cm) in enumerate(curr_matchers):
+                m_affinity = 0
+                if target_hooks is not None:
+                    cm_hooks = cm.get("hooks", [])
+                    matches = sum(1 for th in target_hooks if th in cm_hooks)
+                    m_affinity += matches * 100
+
+                if c_i in paired_curr_to_orig:
+                    om = orig_matchers[paired_curr_to_orig[c_i]]
+                    om_has_canonical = any(
+                        isinstance(oh, dict) and (get_managed_hook_info(oh.get("command", "")) or {}).get("canonical") == sub_info["canonical"]
+                        for oh in om.get("hooks", [])
+                    )
+                    if not om_has_canonical:
+                        m_affinity += 500
+
+                for s_idx, sh in enumerate(cm.get("hooks", [])):
+                    if (c_idx, s_idx) in protected_sub_hooks:
+                        continue
+                    if isinstance(sh, dict) and "command" in sh:
+                        sh_info = get_managed_hook_info(sh["command"])
+                        if sh_info and sh_info["binary"] == sub_info["binary"] and sh_info["canonical"] == sub_info["canonical"]:
+                            if sh.get("timeout") == m["hook"].get("timeout"):
+                                if m_affinity > best_candidate_score:
+                                    best_candidate_score = m_affinity
+                                    best_target_m = cm
+                                    best_target_s_idx = s_idx
+
+            if best_target_m is not None and best_target_s_idx != -1:
+                del best_target_m["hooks"][best_target_s_idx]
                 changed = True
         elif m_type == "upgrade_sub":
             pattern = m["pattern"]
@@ -845,7 +931,8 @@ def derive_mutations(manifest, frag, home):
                                 for sh in first_m.get("hooks", [])
                             )
                             if not first_has:
-                                mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h)})
+                                first_subs = first_m.get("hooks", []) if isinstance(first_m.get("hooks"), list) else []
+                                mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h), "target_hooks": copy.deepcopy(first_subs)})
     return mutations
 
 if existing_manifest and "mutations" not in existing_manifest:
@@ -976,8 +1063,9 @@ for key, frag_group in frag.items():
                                                     sub_replaced = True
                                                     break
                                     if not sub_replaced:
+                                        target_hooks_snapshot = [copy.deepcopy(sh) for sh in existing_subs]
                                         existing_subs.append(copy.deepcopy(sub_h))
-                                        mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": h["matcher"], "hook": copy.deepcopy(sub_h)})
+                                        mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": h["matcher"], "hook": copy.deepcopy(sub_h), "target_hooks": target_hooks_snapshot})
                                 replaced = True
                                 break
                         if not replaced:

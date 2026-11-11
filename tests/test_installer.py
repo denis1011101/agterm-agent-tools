@@ -718,6 +718,37 @@ class TestInstaller(unittest.TestCase):
         result = json.loads(agy_json.read_text())
         self.assertEqual(result, {})
 
+    def test_user_extended_matcher_child_preserved_on_uninstall(self):
+        home = self.root / "home_user_extended_matcher"
+        agy_json = home / ".gemini/config/hooks.json"
+        agy_json.parent.mkdir(parents=True)
+        frag = json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())
+        matcher = frag["agterm-status"]["PreToolUse"][0]
+        original = {
+            "agterm-status": {
+                "PreToolUse": [
+                    {"matcher": matcher["matcher"], "hooks": [{"type": "command", "command": "echo CUSTOM"}]},
+                    copy.deepcopy(matcher),
+                ]
+            }
+        }
+        agy_json.write_text(json.dumps(original))
+
+        self.run_installer(home)
+        data = json.loads(agy_json.read_text())
+        data["agterm-status"]["PreToolUse"].reverse()
+        custom = {"type": "command", "command": "echo KEEP_ME"}
+        data["agterm-status"]["PreToolUse"][0]["hooks"].append(custom)
+        agy_json.write_text(json.dumps(data))
+
+        expected = copy.deepcopy(original)
+        expected["agterm-status"]["PreToolUse"].reverse()
+        expected["agterm-status"]["PreToolUse"][0]["hooks"].append(custom)
+
+        self.run_installer(home, args=["--uninstall"])
+        result = json.loads(agy_json.read_text())
+        self.assertEqual(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
