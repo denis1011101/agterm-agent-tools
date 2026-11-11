@@ -428,36 +428,165 @@ def reconcile_hook_list(curr_list, orig_list):
 
 uninstall_event_list = reconcile_hook_list
 
-changed = False
+def rollback_mutations(data, manifest):
+    mutations = manifest.get("mutations", [])
+    if not mutations:
+        return False
 
-for key in ["agterm-status", "mailbox-chat"]:
-    if key in data:
-        group = data[key]
-        if isinstance(group, dict):
+    changed = False
+    orig_status = manifest.get("original_agterm_status") or {}
+    orig_chat = manifest.get("original_mailbox_chat") or {}
+
+    for m in reversed(mutations):
+        m_type = m.get("type")
+        key = m.get("key")
+        event = m.get("event")
+        if key not in data or not isinstance(data[key], dict):
+            continue
+        if event not in data[key] or not isinstance(data[key][event], list):
+            continue
+
+        if m_type == "add_direct":
+            h_info = get_managed_hook_info(m["hook"].get("command", ""))
+            if not h_info:
+                continue
+            for idx, curr_h in enumerate(data[key][event]):
+                if isinstance(curr_h, dict) and "command" in curr_h:
+                    c_info = get_managed_hook_info(curr_h["command"])
+                    if c_info and c_info["binary"] == h_info["binary"] and c_info["canonical"] == h_info["canonical"]:
+                        del data[key][event][idx]
+                        changed = True
+                        break
+        elif m_type == "upgrade_direct":
+            h_info = get_managed_hook_info(m["to"].get("command", ""))
+            if not h_info:
+                continue
+            for idx, curr_h in enumerate(data[key][event]):
+                if isinstance(curr_h, dict) and "command" in curr_h:
+                    c_info = get_managed_hook_info(curr_h["command"])
+                    if c_info and c_info["binary"] == h_info["binary"] and c_info["canonical"] == h_info["canonical"]:
+                        data[key][event][idx]["command"] = m["from"]["command"]
+                        changed = True
+                        break
+        elif m_type == "add_matcher":
+            pattern = m["matcher"].get("matcher")
+            for idx, curr_m in enumerate(data[key][event]):
+                if isinstance(curr_m, dict) and curr_m.get("matcher") == pattern:
+                    has_custom = any(
+                        isinstance(sh, dict) and not get_managed_hook_info(sh.get("command", ""))
+                        for sh in curr_m.get("hooks", [])
+                    )
+                    if not has_custom:
+                        del data[key][event][idx]
+                        changed = True
+                        break
+                    else:
+                        curr_m["hooks"] = [
+                            sh for sh in curr_m.get("hooks", [])
+                            if not (isinstance(sh, dict) and get_managed_hook_info(sh.get("command", "")))
+                        ]
+                        changed = True
+                        break
+        elif m_type == "add_sub":
+            pattern = m["pattern"]
+            sub_info = get_managed_hook_info(m["hook"].get("command", ""))
+            if not sub_info:
+                continue
+
+            target_m = None
+            target_s_idx = -1
+            for curr_m in data[key][event]:
+                if isinstance(curr_m, dict) and curr_m.get("matcher") == pattern and isinstance(curr_m.get("hooks"), list):
+                    for s_idx, s_h in enumerate(curr_m["hooks"]):
+                        if isinstance(s_h, dict) and "command" in s_h:
+                            s_info = get_managed_hook_info(s_h["command"])
+                            if s_info and s_info["binary"] == sub_info["binary"] and s_info["canonical"] == sub_info["canonical"]:
+                                if s_h.get("timeout") == m["hook"].get("timeout"):
+                                    target_m = curr_m
+                                    target_s_idx = s_idx
+                                    break
+                                elif target_m is None:
+                                    target_m = curr_m
+                                    target_s_idx = s_idx
+                    if target_s_idx != -1 and target_m.get("hooks", [])[target_s_idx].get("timeout") == m["hook"].get("timeout"):
+                        break
+
+            if target_m is not None and target_s_idx != -1:
+                del target_m["hooks"][target_s_idx]
+                changed = True
+        elif m_type == "upgrade_sub":
+            pattern = m["pattern"]
+            sub_info = get_managed_hook_info(m["to"].get("command", ""))
+            if not sub_info:
+                continue
+            for curr_m in data[key][event]:
+                if isinstance(curr_m, dict) and curr_m.get("matcher") == pattern and isinstance(curr_m.get("hooks"), list):
+                    for s_idx, s_h in enumerate(curr_m["hooks"]):
+                        if isinstance(s_h, dict) and "command" in s_h:
+                            s_info = get_managed_hook_info(s_h["command"])
+                            if s_info and s_info["binary"] == sub_info["binary"] and s_info["canonical"] == sub_info["canonical"]:
+                                curr_m["hooks"][s_idx]["command"] = m["from"]["command"]
+                                changed = True
+                                break
+
+    # Clean up empty matchers, events, and groups
+    for key in ["agterm-status", "mailbox-chat"]:
+        if key in data and isinstance(data[key], dict):
             clean_key = key.replace("-", "_")
             orig_group = manifest.get("original_" + clean_key)
             was_created = manifest.get("created_" + clean_key, False)
-            for event_name in list(group.keys()):
-                if isinstance(group[event_name], list):
-                    orig_event_list = orig_group.get(event_name, []) if isinstance(orig_group, dict) else []
-                    new_event_list = uninstall_event_list(group[event_name], orig_event_list)
-
-                    if new_event_list:
-                        if new_event_list != group[event_name]:
-                            group[event_name] = new_event_list
-                            changed = True
-                    else:
-                        if isinstance(orig_group, dict) and event_name in orig_group and orig_group[event_name] == []:
-                            if group[event_name] != []:
-                                group[event_name] = []
-                                changed = True
+            for event in list(data[key].keys()):
+                if isinstance(data[key][event], list):
+                    data[key][event] = [
+                        item for item in data[key][event]
+                        if not (isinstance(item, dict) and "matcher" in item and "hooks" in item and not item["hooks"])
+                    ]
+                    if not data[key][event]:
+                        if isinstance(orig_group, dict) and event in orig_group and orig_group[event] == []:
+                            pass
                         else:
-                            del group[event_name]
+                            del data[key][event]
                             changed = True
 
-            if was_created and not group:
+            if was_created and not data[key]:
                 del data[key]
                 changed = True
+
+    return changed
+
+changed = False
+
+if manifest.get("mutations"):
+    changed = rollback_mutations(data, manifest)
+else:
+    for key in ["agterm-status", "mailbox-chat"]:
+        if key in data:
+            group = data[key]
+            if isinstance(group, dict):
+                clean_key = key.replace("-", "_")
+                orig_group = manifest.get("original_" + clean_key)
+                was_created = manifest.get("created_" + clean_key, False)
+                for event_name in list(group.keys()):
+                    if isinstance(group[event_name], list):
+                        orig_event_list = orig_group.get(event_name, []) if isinstance(orig_group, dict) else []
+                        new_event_list = uninstall_event_list(group[event_name], orig_event_list)
+
+                        if new_event_list:
+                            if new_event_list != group[event_name]:
+                                group[event_name] = new_event_list
+                                changed = True
+                        else:
+                            if isinstance(orig_group, dict) and event_name in orig_group and orig_group[event_name] == []:
+                                if group[event_name] != []:
+                                    group[event_name] = []
+                                    changed = True
+                            else:
+                                del group[event_name]
+                                changed = True
+
+                if was_created and not group:
+                    del data[key]
+                    changed = True
 
 if changed:
     if not manifest.get("file_existed", True) and not data:
@@ -655,21 +784,16 @@ manifest = {
     "updated_at": int(time.time())
 }
 
-tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
-with open(tmp_manifest, "w", encoding="utf-8") as f:
-    json.dump(manifest, f, indent=2)
-os.replace(tmp_manifest, manifest_file)
+mutations = []
 
 # Surgical merge and upgrade reconciliation:
 for key, frag_group in frag.items():
     if key not in data or not isinstance(data[key], dict):
-        data[key] = copy.deepcopy(frag_group)
-    else:
-        for event_name, hook_list in frag_group.items():
-            if event_name not in data[key] or not isinstance(data[key][event_name], list):
-                data[key][event_name] = copy.deepcopy(hook_list)
-            else:
-                for h in hook_list:
+        data[key] = {}
+    for event_name, hook_list in frag_group.items():
+        if event_name not in data[key] or not isinstance(data[key][event_name], list):
+            data[key][event_name] = []
+        for h in hook_list:
                     if "command" in h:
                         h_info = get_managed_hook_info(h["command"])
                         replaced = False
@@ -678,7 +802,9 @@ for key, frag_group in frag.items():
                                 ex_info = get_managed_hook_info(existing_h["command"])
                                 if ex_info and h_info and ex_info["binary"] == h_info["binary"] and ex_info["canonical"] == h_info["canonical"]:
                                     if ex_info["is_legacy"]:
+                                        orig_cmd = copy.deepcopy(existing_h)
                                         data[key][event_name][idx]["command"] = h["command"]
+                                        mutations.append({"type": "upgrade_direct", "key": key, "event": event_name, "from": orig_cmd, "to": copy.deepcopy(h)})
                                         replaced = True
                                         break
                                     else:
@@ -687,6 +813,7 @@ for key, frag_group in frag.items():
                                         break
                         if not replaced:
                             data[key][event_name].append(copy.deepcopy(h))
+                            mutations.append({"type": "add_direct", "key": key, "event": event_name, "hook": copy.deepcopy(h)})
                     elif "matcher" in h and "hooks" in h:
                         replaced = False
                         for existing_m in data[key][event_name]:
@@ -700,7 +827,9 @@ for key, frag_group in frag.items():
                                             ex_sub_info = get_managed_hook_info(s_h["command"])
                                             if ex_sub_info and sub_info and ex_sub_info["binary"] == sub_info["binary"] and ex_sub_info["canonical"] == sub_info["canonical"]:
                                                 if ex_sub_info["is_legacy"]:
+                                                    orig_sub = copy.deepcopy(s_h)
                                                     existing_subs[s_idx]["command"] = sub_h["command"]
+                                                    mutations.append({"type": "upgrade_sub", "key": key, "event": event_name, "pattern": h["matcher"], "from": orig_sub, "to": copy.deepcopy(sub_h)})
                                                     sub_replaced = True
                                                     break
                                                 else:
@@ -708,10 +837,20 @@ for key, frag_group in frag.items():
                                                     break
                                     if not sub_replaced:
                                         existing_subs.append(copy.deepcopy(sub_h))
+                                        mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": h["matcher"], "hook": copy.deepcopy(sub_h)})
                                 replaced = True
                                 break
                         if not replaced:
                             data[key][event_name].append(copy.deepcopy(h))
+                            mutations.append({"type": "add_matcher", "key": key, "event": event_name, "matcher": copy.deepcopy(h)})
+
+manifest["mutations"] = existing_manifest.get("mutations", mutations)
+manifest["installed_snapshot"] = copy.deepcopy(data)
+
+tmp_manifest = f"{manifest_file}.tmp.{uuid.uuid4().hex}"
+with open(tmp_manifest, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+os.replace(tmp_manifest, manifest_file)
 
 tmp_target = f"{target_path}.tmp.{uuid.uuid4().hex}"
 with open(tmp_target, "w", encoding="utf-8") as f:
