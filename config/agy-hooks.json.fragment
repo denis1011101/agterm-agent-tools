@@ -47,5 +47,19 @@
         "timeout": 5
       }
     ]
+  },
+  "safety-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.config/agterm/hooks/agy/safety-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
   }
 }

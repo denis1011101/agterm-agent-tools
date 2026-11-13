@@ -51,6 +51,173 @@ class TestInstaller(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"Installer failed with code {r.returncode}: {r.stderr}")
         return r
 
+    def safety_fragment(self):
+        return json.loads((REPO_ROOT / "config/agy-hooks.json.fragment").read_text())["safety-guard"]
+
+    def test_safety_guard_install_reinstall_and_uninstall(self):
+        home = self.root / "home_guard_lifecycle"
+        self.run_installer(home)
+        link = home / ".config/agterm/hooks/agy/safety-guard.py"
+        hooks = home / ".gemini/config/hooks.json"
+        manifest_path = home / ".local/state/agterm-agent-tools/manifest.json"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), REPO_ROOT / "hooks/agy/safety-guard.py")
+        self.assertTrue(os.access(link, os.X_OK))
+        self.assertEqual(json.loads(hooks.read_text())["safety-guard"], self.safety_fragment())
+        manifest = json.loads(manifest_path.read_text())
+        self.assertIsNone(manifest["original_safety_guard"])
+        self.assertTrue(manifest["created_safety_guard"])
+        self.assertTrue(any(m["key"] == "safety-guard" for m in manifest["mutations"]))
+
+        self.run_installer(home)
+        self.assertEqual(json.loads(hooks.read_text())["safety-guard"], self.safety_fragment())
+        self.assertEqual(json.loads(manifest_path.read_text())["mutations"], manifest["mutations"])
+        self.run_installer(home, args=["--uninstall"])
+        self.assertFalse(link.is_symlink())
+        self.assertFalse(manifest_path.exists())
+        self.assertFalse(hooks.exists())
+
+    def test_safety_guard_foreign_hooks_survive_install_and_uninstall(self):
+        home = self.root / "home_guard_foreign"
+        hooks = home / ".gemini/config/hooks.json"
+        hooks.parent.mkdir(parents=True)
+        original = {"safety-guard": {"PreToolUse": [
+            {"matcher": "*", "hooks": [{"type": "command", "command": "echo CUSTOM"}]}
+        ], "user_metadata": "keep"}}
+        hooks.write_text(json.dumps(original))
+        self.run_installer(home)
+        current = json.loads(hooks.read_text())
+        self.assertEqual(len(current["safety-guard"]["PreToolUse"][0]["hooks"]), 2)
+        self.run_installer(home)
+        self.assertEqual(json.loads(hooks.read_text()), current)
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(json.loads(hooks.read_text()), original)
+        self.assertFalse((home / ".config/agterm/hooks/agy/safety-guard.py").is_symlink())
+
+    def test_preexisting_safety_guard_registration_and_script_are_preserved(self):
+        home = self.root / "home_guard_preexisting"
+        hooks = home / ".gemini/config/hooks.json"
+        hooks.parent.mkdir(parents=True)
+        guard = home / ".config/agterm/hooks/agy/safety-guard.py"
+        guard.parent.mkdir(parents=True)
+        guard.write_text("# original local hook\n")
+        original = {"safety-guard": self.safety_fragment()}
+        original["safety-guard"]["PreToolUse"][0]["hooks"][0]["timeout"] = 20
+        hooks.write_text(json.dumps(original))
+        self.run_installer(home)
+        self.assertTrue(guard.is_symlink())
+        backups = list(guard.parent.glob("safety-guard.py.bak.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "# original local hook\n")
+        self.run_installer(home)
+        self.assertEqual(json.loads(hooks.read_text())["safety-guard"], original["safety-guard"])
+        self.assertEqual(len(list(guard.parent.glob("safety-guard.py.bak.*"))), 1)
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(json.loads(hooks.read_text()), original)
+        # Uninstall must not leave the pre-existing registration pointing at nothing.
+        self.assertTrue(guard.is_symlink())
+        self.assertTrue(guard.exists())
+
+    def test_safety_guard_user_append_preserved_and_owned_command_removed(self):
+        home = self.root / "home_guard_user_append"
+        self.run_installer(home)
+        hooks = home / ".gemini/config/hooks.json"
+        current = json.loads(hooks.read_text())
+        custom = {"type": "command", "command": "echo USER_GUARD"}
+        current["safety-guard"]["PreToolUse"][0]["hooks"].append(custom)
+        hooks.write_text(json.dumps(current))
+        self.run_installer(home, args=["--uninstall"])
+        self.assertEqual(json.loads(hooks.read_text()), {"safety-guard": {
+            "PreToolUse": [{"matcher": "*", "hooks": [custom]}]
+        }})
+
+    def emulate_old_guard_manifest(self, home, legacy=False):
+        hooks = home / ".gemini/config/hooks.json"
+        path = home / ".local/state/agterm-agent-tools/manifest.json"
+        data = json.loads(hooks.read_text())
+        data.pop("safety-guard", None)
+        hooks.write_text(json.dumps(data))
+        manifest = json.loads(path.read_text())
+        manifest.pop("original_safety_guard", None)
+        manifest.pop("created_safety_guard", None)
+        manifest["mutations"] = [m for m in manifest["mutations"] if m["key"] != "safety-guard"]
+        manifest["installed_snapshot"].pop("safety-guard", None)
+        if legacy:
+            manifest.pop("mutations")
+            manifest.pop("installed_snapshot")
+        path.write_text(json.dumps(manifest))
+        return hooks, path
+
+    def test_upgrade_from_old_manifest_installs_guard_and_records_ownership(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                home = self.root / ("home_guard_upgrade_" + str(legacy))
+                self.run_installer(home)
+                hooks, manifest_path = self.emulate_old_guard_manifest(home, legacy)
+                self.run_installer(home)
+                manifest = json.loads(manifest_path.read_text())
+                self.assertIsNone(manifest["original_safety_guard"])
+                self.assertTrue(manifest["created_safety_guard"])
+                self.assertEqual(json.loads(hooks.read_text())["safety-guard"], self.safety_fragment())
+                self.assertTrue(any(m["key"] == "safety-guard" for m in manifest["mutations"]))
+                self.run_installer(home, args=["--uninstall"])
+                self.assertFalse(hooks.exists())
+
+    def test_upgrade_old_manifest_does_not_adopt_preexisting_guard(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                home = self.root / ("home_guard_existing_upgrade_" + str(legacy))
+                self.run_installer(home)
+                hooks, manifest_path = self.emulate_old_guard_manifest(home, legacy)
+                data = json.loads(hooks.read_text())
+                data["safety-guard"] = self.safety_fragment()
+                hooks.write_text(json.dumps(data))
+                self.run_installer(home)
+                manifest = json.loads(manifest_path.read_text())
+                self.assertEqual(manifest["original_safety_guard"], self.safety_fragment())
+                self.assertFalse(manifest["created_safety_guard"])
+                self.assertFalse(any(m["key"] == "safety-guard" for m in manifest["mutations"]))
+                self.run_installer(home, args=["--uninstall"])
+                self.assertEqual(json.loads(hooks.read_text()), {"safety-guard": self.safety_fragment()})
+                self.assertTrue((home / ".config/agterm/hooks/agy/safety-guard.py").exists())
+
+    def test_uninstall_old_manifest_leaves_unowned_guard_untouched(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                home = self.root / ("home_guard_old_uninstall_" + str(legacy))
+                self.run_installer(home)
+                hooks, _ = self.emulate_old_guard_manifest(home, legacy)
+                data = json.loads(hooks.read_text())
+                original = {"PreToolUse": [{"matcher": "*", "hooks": [
+                    {"type": "command", "command": "echo UNOWNED"}
+                ]}]}
+                data["safety-guard"] = original
+                hooks.write_text(json.dumps(data))
+                self.run_installer(home, args=["--uninstall"])
+                self.assertEqual(json.loads(hooks.read_text()), {"safety-guard": original})
+
+    def test_safety_guard_reinstall_restores_missing_registration(self):
+        home = self.root / "home_guard_repair"
+        self.run_installer(home)
+        hooks = home / ".gemini/config/hooks.json"
+        data = json.loads(hooks.read_text())
+        del data["safety-guard"]
+        hooks.write_text(json.dumps(data))
+        self.run_installer(home)
+        self.assertEqual(json.loads(hooks.read_text())["safety-guard"], self.safety_fragment())
+
+    def test_safety_guard_dry_run_does_not_change_local_script(self):
+        home = self.root / "home_guard_dryrun"
+        guard = home / ".config/agterm/hooks/agy/safety-guard.py"
+        guard.parent.mkdir(parents=True)
+        guard.write_text("# untouched local script\n")
+        self.run_installer(home, args=["--dry-run"])
+        self.assertFalse(guard.is_symlink())
+        self.assertEqual(guard.read_text(), "# untouched local script\n")
+        self.assertFalse(list(guard.parent.glob("safety-guard.py.bak.*")))
+        self.assertFalse((home / ".local/state/agterm-agent-tools/manifest.json").exists())
+
+
     def test_clean_install_and_symlinks(self):
         home = self.root / "home_clean"
         (home / ".codex").mkdir(parents=True)

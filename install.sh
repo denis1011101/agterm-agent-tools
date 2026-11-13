@@ -15,7 +15,7 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Install or uninstall agterm-agent-tools (mailbox-chat, status hooks, skills).
+Install or uninstall agterm-agent-tools (mailbox-chat, status/safety hooks, skills).
 
 Options:
   --dry-run       Show actions that would be taken without modifying anything
@@ -28,6 +28,7 @@ Components installed:
       ~/.local/bin/codex-mailbox   -> bin/codex-mailbox
   - agterm hooks:
       ~/.config/agterm/hooks/agy/agy-status-hook.sh        -> hooks/agy/agy-status-hook.sh
+      ~/.config/agterm/hooks/agy/safety-guard.py           -> hooks/agy/safety-guard.py
       ~/.config/agterm/agent-status/agterm-agent-status.sh -> hooks/agterm/agterm-agent-status.sh
       ~/.config/agterm/agent-status/agterm-codex-status.sh -> hooks/agterm/agterm-codex-status.sh
       ~/.config/agterm/hooks.conf (mailbox hook entry)
@@ -183,6 +184,35 @@ make_symlink() {
     fi
 }
 
+manage_safety_guard_symlink() {
+    local src="$SCRIPT_DIR/hooks/agy/safety-guard.py"
+    local dest="$HOME/.config/agterm/hooks/agy/safety-guard.py"
+    local target_json="$HOME/.gemini/config/hooks.json"
+
+    # Do not break a pre-existing/user-preserved hook during uninstall.
+    if (( UNINSTALL )) && [[ -f "$target_json" ]] && python3 -c '
+import json, sys
+
+def references_guard(obj):
+    if isinstance(obj, dict):
+        command = obj.get("command", "")
+        if isinstance(command, str) and ".config/agterm/hooks/agy/safety-guard.py" in command:
+            return True
+        return any(references_guard(value) for value in obj.values())
+    if isinstance(obj, list):
+        return any(references_guard(value) for value in obj)
+    return False
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+sys.exit(0 if references_guard(data) else 1)
+' "$target_json"; then
+        log_action "Preserving safety-guard symlink: a remaining hook still references it."
+        return 0
+    fi
+    make_symlink "$src" "$dest"
+}
+
 manage_agterm_hooks_conf() {
     local conf_file="$HOME/.config/agterm/hooks.conf"
     local hook_line='on message "$HOME/.local/bin/mailbox-chat.py" agterm-hook'
@@ -284,11 +314,13 @@ if not isinstance(data, dict):
 
 MANAGED_BIN_RELPATHS = {
     ".config/agterm/hooks/agy/agy-status-hook.sh": "agy-status-hook.sh",
+    ".config/agterm/hooks/agy/safety-guard.py": "safety-guard.py",
     ".local/bin/mailbox-chat.py": "mailbox-chat.py",
 }
 
 MANAGED_ACTIONS = {
     "agy-status-hook.sh": {"invocation", "ask", "tool-done", "stop"},
+    "safety-guard.py": {""},
     "mailbox-chat.py": {"agy-hook"},
 }
 
@@ -486,10 +518,14 @@ def derive_mutations(manifest, frag, home):
     orig_chat = manifest.get("original_mailbox_chat")
     orig = {
         "agterm-status": orig_status if isinstance(orig_status, dict) else {},
-        "mailbox-chat": orig_chat if isinstance(orig_chat, dict) else {}
+        "mailbox-chat": orig_chat if isinstance(orig_chat, dict) else {},
+        "safety-guard": manifest.get("original_safety_guard") or {}
     }
 
     for key, frag_group in frag.items():
+        # Older manifests do not own groups introduced by a later installer.
+        if "original_" + key.replace("-", "_") not in manifest:
+            continue
         if not isinstance(frag_group, dict):
             continue
         orig_group = orig.get(key, {})
@@ -625,7 +661,7 @@ def rollback_mutations(data, manifest):
             if not sub_info:
                 continue
 
-            orig_group = orig_status if key == "agterm-status" else orig_chat
+            orig_group = manifest.get("original_" + key.replace("-", "_")) or {}
             orig_event_list = orig_group.get(event, []) if isinstance(orig_group, dict) else []
             orig_matchers = [
                 om for om in orig_event_list
@@ -804,7 +840,9 @@ def rollback_mutations(data, manifest):
                                 break
 
     # Clean up empty matchers, events, and groups
-    for key in ["agterm-status", "mailbox-chat"]:
+    for key in ["agterm-status", "mailbox-chat", "safety-guard"]:
+        if "original_" + key.replace("-", "_") not in manifest:
+            continue
         if key in data and isinstance(data[key], dict):
             clean_key = key.replace("-", "_")
             orig_group = manifest.get("original_" + clean_key)
@@ -841,7 +879,9 @@ if "mutations" not in manifest:
 if manifest.get("mutations"):
     changed = rollback_mutations(data, manifest)
 else:
-    for key in ["agterm-status", "mailbox-chat"]:
+    for key in ["agterm-status", "mailbox-chat", "safety-guard"]:
+        if "original_" + key.replace("-", "_") not in manifest:
+            continue
         if key in data:
             group = data[key]
             if isinstance(group, dict):
@@ -952,11 +992,13 @@ if os.path.exists(target_path):
 
 MANAGED_BIN_RELPATHS = {
     ".config/agterm/hooks/agy/agy-status-hook.sh": "agy-status-hook.sh",
+    ".config/agterm/hooks/agy/safety-guard.py": "safety-guard.py",
     ".local/bin/mailbox-chat.py": "mailbox-chat.py",
 }
 
 MANAGED_ACTIONS = {
     "agy-status-hook.sh": {"invocation", "ask", "tool-done", "stop"},
+    "safety-guard.py": {""},
     "mailbox-chat.py": {"agy-hook"},
 }
 
@@ -1011,10 +1053,14 @@ def derive_mutations(manifest, frag, home):
     orig_chat = manifest.get("original_mailbox_chat")
     orig = {
         "agterm-status": orig_status if isinstance(orig_status, dict) else {},
-        "mailbox-chat": orig_chat if isinstance(orig_chat, dict) else {}
+        "mailbox-chat": orig_chat if isinstance(orig_chat, dict) else {},
+        "safety-guard": manifest.get("original_safety_guard") or {}
     }
 
     for key, frag_group in frag.items():
+        # Older manifests do not own groups introduced by a later installer.
+        if "original_" + key.replace("-", "_") not in manifest:
+            continue
         if not isinstance(frag_group, dict):
             continue
         orig_group = orig.get(key, {})
@@ -1063,6 +1109,11 @@ def derive_mutations(manifest, frag, home):
                                 mutations.append({"type": "add_sub", "key": key, "event": event_name, "pattern": pattern, "hook": copy.deepcopy(sub_h), "target_hooks": copy.deepcopy(first_subs)})
     return mutations
 
+# On upgrade, preserve a pre-existing safety guard independently of older groups.
+if existing_manifest and "original_safety_guard" not in existing_manifest:
+    existing_manifest["original_safety_guard"] = copy.deepcopy(data.get("safety-guard"))
+    existing_manifest["created_safety_guard"] = "safety-guard" not in data
+
 if existing_manifest and "mutations" not in existing_manifest:
     existing_manifest["mutations"] = derive_mutations(existing_manifest, frag, home)
     existing_manifest["installed_snapshot"] = copy.deepcopy(data)
@@ -1107,9 +1158,9 @@ def group_has_our_hooks(group, frag_group):
                     return False
     return True
 
-already_up_to_date = (
-    group_has_our_hooks(data.get("agterm-status"), frag.get("agterm-status", {})) and
-    group_has_our_hooks(data.get("mailbox-chat"), frag.get("mailbox-chat", {}))
+already_up_to_date = all(
+    group_has_our_hooks(data.get(key), group)
+    for key, group in frag.items()
 )
 
 if already_up_to_date and os.path.exists(manifest_file):
@@ -1133,8 +1184,10 @@ manifest = {
     "file_existed": existing_manifest.get("file_existed", file_existed),
     "original_agterm_status": existing_manifest.get("original_agterm_status", copy.deepcopy(data.get("agterm-status"))),
     "original_mailbox_chat": existing_manifest.get("original_mailbox_chat", copy.deepcopy(data.get("mailbox-chat"))),
+    "original_safety_guard": existing_manifest.get("original_safety_guard", copy.deepcopy(data.get("safety-guard"))),
     "created_agterm_status": existing_manifest.get("created_agterm_status", "agterm-status" not in data),
     "created_mailbox_chat": existing_manifest.get("created_mailbox_chat", "mailbox-chat" not in data),
+    "created_safety_guard": existing_manifest.get("created_safety_guard", "safety-guard" not in data),
     "installed_at": existing_manifest.get("installed_at", int(time.time())),
     "updated_at": int(time.time())
 }
@@ -1333,6 +1386,7 @@ main() {
 
         log_info "Managing hook scripts..."
         make_symlink "$SCRIPT_DIR/hooks/agy/agy-status-hook.sh"        "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+        manage_safety_guard_symlink
         make_symlink "$SCRIPT_DIR/hooks/agterm/agterm-agent-status.sh" "$HOME/.config/agterm/agent-status/agterm-agent-status.sh"
         make_symlink "$SCRIPT_DIR/hooks/agterm/agterm-codex-status.sh" "$HOME/.config/agterm/agent-status/agterm-codex-status.sh"
 
@@ -1353,6 +1407,7 @@ main() {
     # 2. Hooks
     log_info "Managing hook scripts..."
     make_symlink "$SCRIPT_DIR/hooks/agy/agy-status-hook.sh"        "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+    manage_safety_guard_symlink
     make_symlink "$SCRIPT_DIR/hooks/agterm/agterm-agent-status.sh" "$HOME/.config/agterm/agent-status/agterm-agent-status.sh"
     make_symlink "$SCRIPT_DIR/hooks/agterm/agterm-codex-status.sh" "$HOME/.config/agterm/agent-status/agterm-codex-status.sh"
 

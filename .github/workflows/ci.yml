@@ -32,7 +32,7 @@ jobs:
 
       - name: Compile Python files (syntax validation)
         run: |
-          python -m py_compile bin/mailbox-chat.py
+          python -m py_compile bin/mailbox-chat.py hooks/agy/safety-guard.py
           python -m py_compile tests/test_*.py
 
       - name: Run unit tests
@@ -92,12 +92,15 @@ jobs:
           test -L "$HOME/.local/bin/mailbox-chat.py"
           test -L "$HOME/.local/bin/codex-mailbox"
           test -L "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+          test -L "$HOME/.config/agterm/hooks/agy/safety-guard.py"
+          test -x "$HOME/.config/agterm/hooks/agy/safety-guard.py"
           test -L "$HOME/.config/agterm/agent-status/agterm-agent-status.sh"
           test -L "$HOME/.config/agterm/agent-status/agterm-codex-status.sh"
           test -L "$HOME/.gemini/config/skills/mailbox-chat"
           test -L "$HOME/.codex/skills/mailbox-chat"
           grep -q "mailbox-chat.py" "$HOME/.config/agterm/hooks.conf"
           grep -q "agterm-status" "$HOME/.gemini/config/hooks.json"
+          grep -q "safety-guard" "$HOME/.gemini/config/hooks.json"
           grep -q "mailbox-chat.py" "$HOME/.codex/config.toml"
 
       - name: Test uninstallation
@@ -106,5 +109,6 @@ jobs:
           test ! -L "$HOME/.local/bin/mailbox-chat.py"
           test ! -L "$HOME/.local/bin/codex-mailbox"
           test ! -L "$HOME/.config/agterm/hooks/agy/agy-status-hook.sh"
+          test ! -L "$HOME/.config/agterm/hooks/agy/safety-guard.py"
           test ! -L "$HOME/.gemini/config/skills/mailbox-chat"
           test ! -L "$HOME/.codex/skills/mailbox-chat"
